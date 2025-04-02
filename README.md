@@ -225,3 +225,38 @@ For more questions/discussions feel free to stop by **#nanoGPT** on Discord:
 ## acknowledgements
 
 All nanoGPT experiments are powered by GPUs on [Lambda labs](https://lambdalabs.com), my favorite Cloud GPU provider. Thank you Lambda labs for sponsoring nanoGPT!
+
+## discussions
+
+> Why loss values of training and validation often have values in range of 2-3.
+
+In the context of GPT-2 and language models, the loss value (both training and validation) represents the cross-entropy loss, which indicates how well the model predicts the next token in a sequence.
+Here's what these numbers mean:
+1. **Cross-entropy Loss Interpretation**:
+    - The loss represents the average negative log likelihood of predicting the correct next token
+    - Lower values indicate better predictions
+    - A loss of 2.0-3.0 means the model is, on average, assigning:
+        - `exp(-2.0) ≈ 0.135` to `exp(-3.0) ≈ 0.050` probability to the correct token
+     
+2. **Why this range (2-3)?**:
+    - GPT models typically work with a vocabulary size of around 50k tokens
+    - If predictions were completely random:
+        - Loss would be `ln(50000) ≈ 10.82`
+
+    - A loss of 2-3 means the model is performing much better than random
+    - However, perfect prediction (loss = 0) is impossible because language has inherent uncertainty
+  
+3. **Context and Benchmarks**:
+    - Professional LLMs often achieve losses around 2.0-2.5 on general text
+    - Lower losses (like 1.5) might indicate:
+        - Very specialized/predictable text
+        - Potential overfitting
+
+    - Higher losses (above 3.0) might indicate:
+        - Poor model performance
+        - Very complex or random text
+
+So when you see losses in the 2-3 range, it indicates the model is learning meaningful patterns in the text, significantly better than random guessing but not unrealistically perfect.
+
+loss = -log(probability_of_correct_token)  # log == ln or natural logarithm
+
