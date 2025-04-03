@@ -181,6 +181,10 @@ class GPT(nn.Module):
             x = block(x)
         x = self.transformer.ln_f(x)
 
+        # TRAINING_NN
+        # Get sequence embedding (mean pooling)
+        sequence_embedding = x.mean(dim=1)  # (b, n_embd)
+
         if targets is not None:
             # if we are given some desired targets also calculate the loss
             logits = self.lm_head(x)
@@ -190,7 +194,7 @@ class GPT(nn.Module):
             logits = self.lm_head(x[:, [-1], :]) # note: using list [-1] to preserve the time dim
             loss = None
 
-        return logits, loss
+        return logits, loss, sequence_embedding
 
     def crop_block_size(self, block_size):
         # model surgery to decrease the block size if necessary
@@ -313,7 +317,7 @@ class GPT(nn.Module):
             # if the sequence context is growing too long we must crop it at block_size
             idx_cond = idx if idx.size(1) <= self.config.block_size else idx[:, -self.config.block_size:]
             # forward the model to get the logits for the index in the sequence
-            logits, _ = self(idx_cond)
+            logits, _, _ = self(idx_cond)
             # pluck the logits at the final step and scale by desired temperature
             logits = logits[:, -1, :] / temperature
             # optionally crop the logits to only the top k options
@@ -328,3 +332,18 @@ class GPT(nn.Module):
             idx = torch.cat((idx, idx_next), dim=1)
 
         return idx
+
+    @torch.no_grad()
+    def generate_with_attribution(self, idx, max_new_tokens, data_store, temperature=1.0, top_k=None):
+        """
+        Generate text with attribution to training examples.
+        Returns: (generated_tokens, relevant_examples)
+        """
+        # Get initial sequence embedding
+        _, _, embedding = self(idx)
+        relevant_examples = data_store.find_nearest_neighbors(embedding)
+
+        # Generate text
+        generated_tokens = self.generate(idx, max_new_tokens, temperature, top_k)
+
+        return generated_tokens, relevant_examples

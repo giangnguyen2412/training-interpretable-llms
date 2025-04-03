@@ -260,3 +260,20 @@ So when you see losses in the 2-3 range, it indicates the model is learning mean
 
 loss = -log(probability_of_correct_token)  # log == ln or natural logarithm
 
+## training insights
+
+### adding training data attribution
+
+- lesson 1 - The decoding of tokenized texts: in the training script, the original raw texts
+were encoded into integer numbers. Later during inference, i need to also use decode() to map the integer
+numbers back to the raw text representation.
+
+todo:
+1. making sure the emddings are good. currently. it looks like the embeddings are generated gradually
+with the evolvements of the trained models. yet, we need to make sure the feature (embeddings) extractor for input
+query and training data are consistent to make sure knn retrieval is working nicely.
+2. 
+
+
+
+

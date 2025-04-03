@@ -7,11 +7,14 @@ from contextlib import nullcontext
 import torch
 import tiktoken
 from model import GPTConfig, GPT
+from training_store import TrainingDataStore
+
 
 # -----------------------------------------------------------------------------
 init_from = 'resume' # either 'resume' (from an out_dir) or a gpt2 variant (e.g. 'gpt2-xl')
 out_dir = 'out' # ignored if init_from is not 'resume'
-start = "\n" # or "<|endoftext|>" or etc. Can also specify a file, use as: "FILE:prompt.txt"
+# start = "\n" # or "<|endoftext|>" or etc. Can also specify a file, use as: "FILE:prompt.txt"
+start = "The weather today is\n" # or "<|endoftext|>" or etc. Can also specify a file, use as: "FILE:prompt.txt"
 num_samples = 10 # number of samples to draw
 max_new_tokens = 500 # number of tokens generated in each sample
 temperature = 0.8 # 1.0 = no change, < 1.0 = less random, > 1.0 = more random, in predictions
@@ -31,6 +34,20 @@ device_type = 'cuda' if 'cuda' in device else 'cpu' # for later use in torch.aut
 ptdtype = {'float32': torch.float32, 'bfloat16': torch.bfloat16, 'float16': torch.float16}[dtype]
 ctx = nullcontext() if device_type == 'cpu' else torch.amp.autocast(device_type=device_type, dtype=ptdtype)
 
+num_neighbors = 3  # Number of relevant examples to show
+
+# -----------------------------------------------------------------------------
+
+def print_relevant_examples(examples):
+    """Print relevant training examples"""
+    print("\nMost relevant training examples:")
+    for idx, example in enumerate(examples, 1):
+        # Clean up or truncate the example if needed
+        clean_text = decode(example)  # Limit length to avoid huge outputs
+        print(f"\n{idx}. Example text:")
+        print(clean_text)
+        print("-" * 40)
+
 # model
 if init_from == 'resume':
     # init from a model saved in a specific directory
@@ -39,6 +56,9 @@ if init_from == 'resume':
     gptconf = GPTConfig(**checkpoint['model_args'])
     model = GPT(gptconf)
     state_dict = checkpoint['model']
+
+    data_store = checkpoint['data_store']
+
     unwanted_prefix = '_orig_mod.'
     for k,v in list(state_dict.items()):
         if k.startswith(unwanted_prefix):
@@ -73,6 +93,10 @@ else:
     encode = lambda s: enc.encode(s, allowed_special={"<|endoftext|>"})
     decode = lambda l: enc.decode(l)
 
+
+# Load training store
+training_store = data_store
+
 # encode the beginning of the prompt
 if start.startswith('FILE:'):
     with open(start[5:], 'r', encoding='utf-8') as f:
@@ -81,9 +105,37 @@ start_ids = encode(start)
 x = (torch.tensor(start_ids, dtype=torch.long, device=device)[None, ...])
 
 # run generation
+# with torch.no_grad():
+#     with ctx:
+#         for k in range(num_samples):
+#             y = model.generate(x, max_new_tokens, temperature=temperature, top_k=top_k)
+#             print(decode(y[0].tolist()))
+#             print('---------------')
+
+# Generate with attribution
+print(f"\nPrompt: {start}")
 with torch.no_grad():
     with ctx:
         for k in range(num_samples):
+            print(f"\nSample {k + 1}:")
+
+            # Get initial embeddings and generate
+            _, _, embedding = model(x)
+            relevant_examples = training_store.find_nearest_neighbors(
+                embedding[-1],  # Use last token's embedding
+                k=num_neighbors
+            )
+
+            breakpoint()
+
+            # Generate text
             y = model.generate(x, max_new_tokens, temperature=temperature, top_k=top_k)
+
+            # Print generated text
+            print("\nGenerated text:")
             print(decode(y[0].tolist()))
-            print('---------------')
+
+            breakpoint()
+            # Print relevant examples
+            print_relevant_examples(relevant_examples)
+            print("=" * 60)
