@@ -8,11 +8,13 @@ import torch
 import tiktoken
 from model import GPTConfig, GPT
 from training_store import TrainingDataStore
-
+from torch.utils.data import Dataset, DataLoader
+from tqdm import tqdm
+import numpy as np
 
 # -----------------------------------------------------------------------------
 init_from = 'resume' # either 'resume' (from an out_dir) or a gpt2 variant (e.g. 'gpt2-xl')
-out_dir = 'out' # ignored if init_from is not 'resume'
+out_dir = 'out_training_attribution' # ignored if init_from is not 'resume'
 # start = "\n" # or "<|endoftext|>" or etc. Can also specify a file, use as: "FILE:prompt.txt"
 start = "The weather today is\n" # or "<|endoftext|>" or etc. Can also specify a file, use as: "FILE:prompt.txt"
 num_samples = 10 # number of samples to draw
@@ -34,6 +36,59 @@ device_type = 'cuda' if 'cuda' in device else 'cpu' # for later use in torch.aut
 ptdtype = {'float32': torch.float32, 'bfloat16': torch.bfloat16, 'float16': torch.float16}[dtype]
 ctx = nullcontext() if device_type == 'cpu' else torch.amp.autocast(device_type=device_type, dtype=ptdtype)
 
+# --------------------------------------------------------------------------
+
+import hashlib
+import json
+
+
+def get_checkpoint_hash(checkpoint):
+    """Create a unique identifier for the checkpoint based on metadata"""
+    metadata = {
+        'val_loss': float(checkpoint['best_val_loss'].cpu().item()),
+        'model_args': checkpoint['model_args'],
+        'iter_num': checkpoint['iter_num'],
+        # Add other relevant metadata
+    }
+    # Create a stable string representation
+    metadata_str = json.dumps(metadata, sort_keys=True)
+    # Create hash
+    return hashlib.md5(metadata_str.encode()).hexdigest()
+
+
+def get_cache_path(checkpoint):
+    """Get path for cached embeddings"""
+    cache_dir = 'embedding_cache'
+    os.makedirs(cache_dir, exist_ok=True)
+
+    checkpoint_hash = get_checkpoint_hash(checkpoint)
+    return os.path.join(cache_dir, f'embeddings_{checkpoint_hash}.pkl')
+
+
+def load_or_compute_embeddings(model, training_data, checkpoint):
+    """Load cached embeddings or compute new ones"""
+    cache_path = get_cache_path(checkpoint)
+
+    # Try to load from cache
+    if os.path.exists(cache_path):
+        print(f"Loading cached embeddings from {cache_path}")
+        with open(cache_path, 'rb') as f:
+            return pickle.load(f)
+
+    # Compute fresh embeddings
+    print("Computing fresh embeddings...")
+    training_store = compute_training_store(model, training_data)
+
+    # Cache the results
+    print(f"Caching embeddings to {cache_path}")
+    with open(cache_path, 'wb') as f:
+        pickle.dump(training_store, f)
+
+    return training_store
+
+
+# -----------------------------------------------------------------------------
+
 num_neighbors = 3  # Number of relevant examples to show
 
 # -----------------------------------------------------------------------------
@@ -48,6 +103,49 @@ def print_relevant_examples(examples):
         print(clean_text)
         print("-" * 40)
 
+
+
+# Add this after model loading and before generation
+def load_training_data():
+    """Load the training data from the checkpoint's config"""
+    if 'config' not in checkpoint or 'dataset' not in checkpoint['config']:
+        raise ValueError("Checkpoint doesn't contain dataset configuration")
+
+    dataset_path = os.path.join('data', checkpoint['config']['dataset'], 'train.bin')
+    if not os.path.exists(dataset_path):
+        raise FileNotFoundError(f"Training data not found at {dataset_path}")
+
+    # Load the binary data
+    data = np.memmap(dataset_path, dtype=np.uint16, mode='r')
+    return data
+
+def compute_training_store(model, data, chunk_size=256):
+    """Compute fresh embeddings for training data"""
+    print("Computing new training store...")
+    training_store = TrainingDataStore()
+
+    # Calculate total number of chunks
+    total_chunks = (len(data) - 1) // chunk_size + 1
+
+    # Process data in chunks with progress bar
+    with tqdm(total=total_chunks, desc="Computing embeddings") as pbar:
+        for i in range(0, len(data) - chunk_size, chunk_size):
+            chunk = data[i:i + chunk_size]
+            input_ids = torch.tensor(chunk, dtype=torch.long, device=device)[None, ...]
+
+            with torch.no_grad():
+                with ctx:
+                    input_ids = input_ids.cuda()
+                    _, _, embedding = model(input_ids)
+                    # Store the chunk and its embedding
+                    training_store.add_example(chunk.tolist(), embedding[-1].cpu())
+
+            pbar.update(1)
+
+    return training_store
+
+###########################################################################
+
 # model
 if init_from == 'resume':
     # init from a model saved in a specific directory
@@ -56,7 +154,7 @@ if init_from == 'resume':
     gptconf = GPTConfig(**checkpoint['model_args'])
     model = GPT(gptconf)
     state_dict = checkpoint['model']
-
+    breakpoint()
     data_store = checkpoint['data_store']
 
     unwanted_prefix = '_orig_mod.'
@@ -64,9 +162,22 @@ if init_from == 'resume':
         if k.startswith(unwanted_prefix):
             state_dict[k[len(unwanted_prefix):]] = state_dict.pop(k)
     model.load_state_dict(state_dict)
+
+    # Compute fresh training store
+    try:
+        training_data = load_training_data()
+        model = model.cuda()
+        # training_store = compute_training_store(model, training_data)
+        training_store = load_or_compute_embeddings(model, training_data, checkpoint)
+    except Exception as e:
+        print(f"Warning: Could not compute fresh training store: {e}")
+        print("Falling back to stored training store")
+        training_store = data_store
 elif init_from.startswith('gpt2'):
     # init from a given GPT-2 model
     model = GPT.from_pretrained(init_from, dict(dropout=0.0))
+
+    training_store = TrainingDataStore()
 
 model.eval()
 model.to(device)
@@ -95,7 +206,7 @@ else:
 
 
 # Load training store
-training_store = data_store
+# training_store = data_store
 
 # encode the beginning of the prompt
 if start.startswith('FILE:'):
@@ -104,13 +215,6 @@ if start.startswith('FILE:'):
 start_ids = encode(start)
 x = (torch.tensor(start_ids, dtype=torch.long, device=device)[None, ...])
 
-# run generation
-# with torch.no_grad():
-#     with ctx:
-#         for k in range(num_samples):
-#             y = model.generate(x, max_new_tokens, temperature=temperature, top_k=top_k)
-#             print(decode(y[0].tolist()))
-#             print('---------------')
 
 # Generate with attribution
 print(f"\nPrompt: {start}")

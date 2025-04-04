@@ -42,9 +42,11 @@ eval_only = False # if True, script exits right after the first eval
 always_save_checkpoint = True # if True, always save a checkpoint after each eval
 init_from = 'scratch' # 'scratch' or 'resume' or 'gpt2*'
 # wandb logging
-wandb_log = False # disabled by default
-wandb_project = 'owt'
-wandb_run_name = 'gpt2' # 'run' + str(time.time())
+wandb_log = True # disabled by default
+wandb_project = 'nanoGPT'
+wandb_run_name = f'gpt2_{time.strftime("%Y%m%d_%H%M%S")}'
+wandb_tags = ['nn_attribution']
+
 # data
 dataset = 'openwebtext'
 # dataset = 'shakespeare_char'
@@ -104,6 +106,19 @@ else:
 tokens_per_iter = gradient_accumulation_steps * ddp_world_size * batch_size * block_size
 print(f"tokens per iteration will be: {tokens_per_iter:,}")
 
+
+if wandb_log and master_process:
+    import wandb
+
+    wandb.init(
+        project=wandb_project,
+        name=wandb_run_name,
+        config=config,
+        tags=wandb_tags,
+        notes="Training GPT with NN attribution tracking",
+        settings=wandb.Settings(start_method="fork"),
+    )
+
 if master_process:
     os.makedirs(out_dir, exist_ok=True)
 torch.manual_seed(1337 + seed_offset)
@@ -134,12 +149,17 @@ data_dir = os.path.join('data', dataset)
 #     return x, y
 
 
+# Create memmap objects at the start
+train_data = np.memmap(os.path.join(data_dir, 'train.bin'), dtype=np.uint16, mode='r')
+val_data = np.memmap(os.path.join(data_dir, 'val.bin'), dtype=np.uint16, mode='r')
+
 # Modify the get_batch function to return text as well:
 def get_batch(split):
-    if split == 'train':
-        data = np.memmap(os.path.join(data_dir, 'train.bin'), dtype=np.uint16, mode='r')
-    else:
-        data = np.memmap(os.path.join(data_dir, 'val.bin'), dtype=np.uint16, mode='r')
+    # if split == 'train':
+    #     data = np.memmap(os.path.join(data_dir, 'train.bin'), dtype=np.uint16, mode='r')
+    # else:
+    #     data = np.memmap(os.path.join(data_dir, 'val.bin'), dtype=np.uint16, mode='r')
+    data = train_data if split == 'train' else val_data
 
     ix = torch.randint(len(data) - block_size, (batch_size,))
     x = torch.stack([torch.from_numpy((data[i:i + block_size]).astype(np.int64)) for i in ix])

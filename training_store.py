@@ -20,8 +20,8 @@ class TrainingDataStore:
             return []
 
         similarities = F.cosine_similarity(
-            query_embedding.unsqueeze(0),
-            torch.stack(self.embeddings),
+            query_embedding.unsqueeze(0).cuda(),
+            torch.stack(self.embeddings).cuda(),
             dim=1
         )
         _, indices = similarities.topk(k)

@@ -264,16 +264,37 @@ loss = -log(probability_of_correct_token)  # log == ln or natural logarithm
 
 ### adding training data attribution
 
-- lesson 1 - The decoding of tokenized texts: in the training script, the original raw texts
-were encoded into integer numbers. Later during inference, i need to also use decode() to map the integer
-numbers back to the raw text representation.
+- Insight 1 – Decoding Tokenized Texts
 
-todo:
-1. making sure the emddings are good. currently. it looks like the embeddings are generated gradually
-with the evolvements of the trained models. yet, we need to make sure the feature (embeddings) extractor for input
-query and training data are consistent to make sure knn retrieval is working nicely.
-2. 
+> During training, the raw texts are tokenized and encoded into integer sequences. At inference time, I need to use decode() to map these integers back to their original text form.
 
+- Insight 2 - Evolving Embeddings
+> Ensure the embeddings are reliable. Currently, embeddings seem to evolve with model training. However, it's important to ensure that the feature extractor (i.e., embedding model) for input queries and training data remains consistent to support effective KNN retrieval.
 
+- Insight 3 - Window size
+Warning: Could not compute fresh training store: Cannot forward sequence of length 2048, block size is only 256
+Falling back to stored training store
 
+> The block_size (256 in my case) is a fundamental architecture limitation defined during model training/initialization. It determines:
+> 1. **Position Embeddings**: The model has position embeddings from 0 to 255 (256 positions). It can't handle tokens beyond this as it doesn't have position encodings for them.
+> 2. **Attention Mechanism**: The self-attention layers are built to handle sequences up to this length. The size of Q K V matrices are fixed to 256
+
+- Insight 4 - Is training nearest neighbor meaningful for LLMs?
+
+> Observation: I think this question boils down to: "Is training nearest neighbor meaningful for generative tasks?"
+> For example, in classification tasks, using NNs may help users compare and contrast the input vs. the NNs so see if the model is correct or not (sorry but I am so overfit into model [verification task](https://proceedings.neurips.cc/paper_files/paper/2021/file/de043a5e421240eb846da8effe472ff1-Paper.pdf))
+> By contrast, in generative tasks, there is no clear boundary between input and output in the training as the training manner is 
+> text continuation/completion. Hence, the explanation "the model is generating this Y from X because in the training set there is a pair of (X_train, Y_train) that is similar to (X, Y)" does not trivial translate.
+
+> Proposed solution: Concatenate the input and output text together (during test time) and use this chunk of text to generate the embeddings for kNN retrieval.
+> The explanation now is: "The model is generating this Y from X because in the training set there is a text chunk that is similar to (X + Y)".
+- Insight 5 - Yes, LLMs generate one **character** at a time.
+
+> In the beginning, I thought we were using a word-based model. 
+> But after some time, I realized that we are using a character-based model because the vocab size is only 65 (it makes me confused why is it so small). 
+> I go back to prepare.py and recognize that we do character-based tokenization.
+> For example, the vocab for training on shakespear writing is:
+> ['\n', ' ', '!', '$', '&', "'", ',', '-', '.', '3', ':', ';', '?', 'A', 'B', 'C', 'D', 'E', 'F', 'G', 'H', 'I', 'J', 'K', 'L', 'M', 'N', 'O', 'P', 'Q', 'R', 'S', 'T', 'U', 'V', 'W', 'X', 'Y', 'Z', 'a', 'b', 'c', 'd', 'e', 'f', 'g', 'h', 'i', 'j', 'k', 'l', 'm', 'n', 'o', 'p', 'q', 'r', 's', 't', 'u', 'v', 'w', 'x', 'y', 'z']
+> Then, the model generates one character at a time, and the training data is also tokenized into characters. 
+> This means that the model is learning to predict the next character in a sequence, rather than the next word.
 
