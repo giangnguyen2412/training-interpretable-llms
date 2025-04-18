@@ -183,7 +183,10 @@ class GPT(nn.Module):
 
         # TRAINING_NN
         # Get sequence embedding (mean pooling)
+        # print(f"Input embedding shape: {x.shape}")
         sequence_embedding = x.mean(dim=1)  # (b, n_embd)
+        # print(f"Output embedding shape: {sequence_embedding.shape}")
+
 
         if targets is not None:
             # if we are given some desired targets also calculate the loss

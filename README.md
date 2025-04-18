@@ -1,29 +1,5 @@
 
-# nanoGPT
-
-![nanoGPT](assets/nanogpt.jpg)
-
-The simplest, fastest repository for training/finetuning medium-sized GPTs. It is a rewrite of [minGPT](https://github.com/karpathy/minGPT) that prioritizes teeth over education. Still under active development, but currently the file `train.py` reproduces GPT-2 (124M) on OpenWebText, running on a single 8XA100 40GB node in about 4 days of training. The code itself is plain and readable: `train.py` is a ~300-line boilerplate training loop and `model.py` a ~300-line GPT model definition, which can optionally load the GPT-2 weights from OpenAI. That's it.
-
-![repro124m](assets/gpt2_124M_loss.png)
-
-Because the code is so simple, it is very easy to hack to your needs, train new models from scratch, or finetune pretrained checkpoints (e.g. biggest one currently available as a starting point would be the GPT-2 1.3B model from OpenAI).
-
-## install
-
-```
-pip install torch numpy transformers datasets tiktoken wandb tqdm
-```
-
-Dependencies:
-
-- [pytorch](https://pytorch.org) <3
-- [numpy](https://numpy.org/install/) <3
--  `transformers` for huggingface transformers <3 (to load GPT-2 checkpoints)
--  `datasets` for huggingface datasets <3 (if you want to download + preprocess OpenWebText)
--  `tiktoken` for OpenAI's fast BPE code <3
--  `wandb` for optional logging <3
--  `tqdm` for progress bars <3
+# nanoGPT with explanations
 
 ## quick start
 
@@ -288,6 +264,21 @@ Falling back to stored training store
 
 > Proposed solution: Concatenate the input and output text together (during test time) and use this chunk of text to generate the embeddings for kNN retrieval.
 > The explanation now is: "The model is generating this Y from X because in the training set there is a text chunk that is similar to (X + Y)".
+
+- Insight 4.1 - The concatenated text is exceeding the context length
+> In the beginning, we only use X to generate the embeddings for kNN retrieval.
+> Now, we have X+Y, which can often exceed the context length of the model.
+> For example, original X has 21 tokens and Y has 521 tokens, so the concatenated text has 542 tokens > 256 (context length).
+> I solved this by using sliding windows of 256 tokens and then perform the average pooling on the embeddings to get the representative embedding for the whole text chunk.
+
+- Insight 4.2 - Can we go back to training and simply increase the context length?
+> When increasing the context length, only the position embeddings are changed to keep track of where tokens are in the text.
+> For Q, K, V, because they have size of NxD where N is the size of token embeddings and tokens are processed one-by-one --> there is no changes in these matrices for Q, K and V.
+> the only change is the position embeddings, which are added to Q, K and V.
+
+> So the answer is Yes, we can go back and expand the context length. I tried it with nanoGPT to increase the context length from 256 -> 512 but did not see improvements in 
+> validation loss. Yet, the model can now process longer text; yay!
+
 - Insight 5 - Yes, LLMs generate one **character** at a time.
 
 > In the beginning, I thought we were using a word-based model. 
@@ -297,4 +288,47 @@ Falling back to stored training store
 > ['\n', ' ', '!', '$', '&', "'", ',', '-', '.', '3', ':', ';', '?', 'A', 'B', 'C', 'D', 'E', 'F', 'G', 'H', 'I', 'J', 'K', 'L', 'M', 'N', 'O', 'P', 'Q', 'R', 'S', 'T', 'U', 'V', 'W', 'X', 'Y', 'Z', 'a', 'b', 'c', 'd', 'e', 'f', 'g', 'h', 'i', 'j', 'k', 'l', 'm', 'n', 'o', 'p', 'q', 'r', 's', 't', 'u', 'v', 'w', 'x', 'y', 'z']
 > Then, the model generates one character at a time, and the training data is also tokenized into characters. 
 > This means that the model is learning to predict the next character in a sequence, rather than the next word.
+
+- Insight 6 - Training data attribution vs. influence.
+> Training Data Attribution: Pinpointing the specific training examples that directly cause or contain a fact in a model’s output, focusing on factual entailment. For example, if an LLM correctly states, "The capital of France is Paris," attribution would point to the training data that explicitly contains this fact (e.g., a sentence like "The capital of France is Paris").
+> For instance, an influential example might teach the model a pattern or association that indirectly affects its output, like learning that certain names are commonly associated with specific roles or entities. --> kNN may be a post-hoc instantiation of this.
+
+- Insight 7: Increasing model size
+> with this: python train.py config/train_shakespeare_char.py --device=cpu --compile=False --eval_iters=20 --log_interval=1 --block_size=64 --batch_size=12 --n_layer=4 --n_head=4 --n_embd=128 --max_iters=2000 --lr_decay_iters=2000 --dropout=0.0 --> model size = 0.8M
+
+> now I try: block size 2048; batchsize 512; 8 layers of transformer, each has 8 heads; n_embed 512 and max_iter 30k
+> python train.py config/train_shakespeare_char.py --device=cpu --compile=False --eval_iters=20 --log_interval=1 --block_size=2048 --batch_size=512 --n_layer=8 --n_head=8 --n_embd=512 --max_iters=30000 --lr_decay_iters=2000 --dropout=0.0 --> 25.2M
+> the model quickly overfits.
+
+- Insight 8: OlmoTrace https://allenai.org/blog/olmotrace
+
+> Highlighting the verbatim spans in the training data.
+
+- Insight 9: Is using the token embedding for kNN retrieval meaningful?
+
+> Current, here is how we extract the embedding of a paragraph from the model:
+```python
+        # forward the GPT model itself
+        tok_emb = self.transformer.wte(idx) # token embeddings of shape (b, t, n_embd)
+        pos_emb = self.transformer.wpe(pos) # position embeddings of shape (t, n_embd)
+        x = self.transformer.drop(tok_emb + pos_emb)
+        for block in self.transformer.h:
+            x = block(x)
+        x = self.transformer.ln_f(x)
+
+        # TRAINING_NN
+        # Get sequence embedding (mean pooling)
+        sequence_embedding = x.mean(dim=1)  # (b, n_embd)
+        
+        # Input embedding shape: torch.Size([1, 1024, 768])
+        # Output embedding shape: torch.Size([1, 768])
+```
+
+> The embedding is extracted at the last layer of the transformer. For example, with the context length of 1024, the embedding for the whole context is torch.Size([1, 1024, 768]).
+> So what I am doing is that I pool over 1024 tokens to get just one vector of torch.Size([1, 768]) that represents both (input prompt + output) and retrieve NNs based on this vector.
+> However, as the LLMs are not trained for any retrieval tasks, the embedding here is not meaningful for similarity retrieval (or at least not working well with cosine function).
+> Indeed, if using BLMs, and a sense vector having the concept of "toxic". We can leverage the sense vector to retrieve the training data NNs and remove them.
+> In this case, the sense vectors may have "cleaner" representations of "toxic" than the token embeddings.
+
+
 

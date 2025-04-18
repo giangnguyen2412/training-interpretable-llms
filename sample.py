@@ -16,8 +16,8 @@ import numpy as np
 init_from = 'resume' # either 'resume' (from an out_dir) or a gpt2 variant (e.g. 'gpt2-xl')
 out_dir = 'out_training_attribution' # ignored if init_from is not 'resume'
 # start = "\n" # or "<|endoftext|>" or etc. Can also specify a file, use as: "FILE:prompt.txt"
-start = "The weather today is\n" # or "<|endoftext|>" or etc. Can also specify a file, use as: "FILE:prompt.txt"
-num_samples = 10 # number of samples to draw
+start = "Tell me the difference between chicken and duck!\n" # or "<|endoftext|>" or etc. Can also specify a file, use as: "FILE:prompt.txt"
+num_samples = 5 # number of samples to draw
 max_new_tokens = 500 # number of tokens generated in each sample
 temperature = 0.8 # 1.0 = no change, < 1.0 = less random, > 1.0 = more random, in predictions
 top_k = 200 # retain only the top_k most likely tokens, clamp others to have 0 probability
@@ -25,7 +25,9 @@ seed = 1337
 device = 'cuda' # examples: 'cpu', 'cuda', 'cuda:0', 'cuda:1', etc.
 dtype = 'bfloat16' if torch.cuda.is_available() and torch.cuda.is_bf16_supported() else 'float16' # 'float32' or 'bfloat16' or 'float16'
 compile = False # use PyTorch 2.0 to compile the model to be faster
-exec(open('configurator.py').read()) # overrides from command line or config file
+
+training_data_attribution = False
+# exec(open('configurator.py').read()) # overrides from command line or config file
 # -----------------------------------------------------------------------------
 
 torch.manual_seed(seed)
@@ -150,34 +152,40 @@ def compute_training_store(model, data, chunk_size=256):
 if init_from == 'resume':
     # init from a model saved in a specific directory
     ckpt_path = os.path.join(out_dir, 'ckpt.pt')
+    print(f"Loading model from {ckpt_path}")
     checkpoint = torch.load(ckpt_path, map_location=device)
     gptconf = GPTConfig(**checkpoint['model_args'])
     model = GPT(gptconf)
     state_dict = checkpoint['model']
-    breakpoint()
     data_store = checkpoint['data_store']
+
+    print(f"best validation loss was {checkpoint['best_val_loss']}")
 
     unwanted_prefix = '_orig_mod.'
     for k,v in list(state_dict.items()):
         if k.startswith(unwanted_prefix):
             state_dict[k[len(unwanted_prefix):]] = state_dict.pop(k)
     model.load_state_dict(state_dict)
+    model = torch.nn.DataParallel(model, device_ids=range(4))
 
-    # Compute fresh training store
-    try:
-        training_data = load_training_data()
-        model = model.cuda()
-        # training_store = compute_training_store(model, training_data)
-        training_store = load_or_compute_embeddings(model, training_data, checkpoint)
-    except Exception as e:
-        print(f"Warning: Could not compute fresh training store: {e}")
-        print("Falling back to stored training store")
-        training_store = data_store
+    if training_data_attribution is True:
+        # Compute fresh training store
+        try:
+            training_data = load_training_data()
+            model = model.cuda()
+            model = torch.nn.DataParallel(model, device_ids=range(4))
+            # training_store = compute_training_store(model, training_data)
+            training_store = load_or_compute_embeddings(model, training_data, checkpoint)
+        except Exception as e:
+            print(f"Warning: Could not compute fresh training store: {e}")
+            print("Falling back to stored training store")
+            training_store = data_store
 elif init_from.startswith('gpt2'):
     # init from a given GPT-2 model
     model = GPT.from_pretrained(init_from, dict(dropout=0.0))
 
-    training_store = TrainingDataStore()
+    if training_data_attribution is True:
+        training_store = TrainingDataStore()
 
 model.eval()
 model.to(device)
@@ -215,6 +223,15 @@ if start.startswith('FILE:'):
 start_ids = encode(start)
 x = (torch.tensor(start_ids, dtype=torch.long, device=device)[None, ...])
 
+def get_embedding_with_window(model, tensor, window_size=256):
+    embeddings = []
+    for i in range(0, tensor.size(1), window_size):
+        window = tensor[:, i:i + window_size]
+        _, _, emb = model(window)
+        embeddings.append(emb[-1])
+    # Combine embeddings (e.g., average them)
+    return torch.stack(embeddings).mean(dim=0)
+
 
 # Generate with attribution
 print(f"\nPrompt: {start}")
@@ -223,15 +240,6 @@ with torch.no_grad():
         for k in range(num_samples):
             print(f"\nSample {k + 1}:")
 
-            # Get initial embeddings and generate
-            _, _, embedding = model(x)
-            relevant_examples = training_store.find_nearest_neighbors(
-                embedding[-1],  # Use last token's embedding
-                k=num_neighbors
-            )
-
-            breakpoint()
-
             # Generate text
             y = model.generate(x, max_new_tokens, temperature=temperature, top_k=top_k)
 
@@ -239,7 +247,19 @@ with torch.no_grad():
             print("\nGenerated text:")
             print(decode(y[0].tolist()))
 
-            breakpoint()
-            # Print relevant examples
-            print_relevant_examples(relevant_examples)
-            print("=" * 60)
+            if training_data_attribution is True:
+
+                # combine input and generated text
+                paragraphed_text = torch.cat([x, y], dim=1)
+
+                # use this combined text to retrieve the relevant examples
+                combined_embedding = get_embedding_with_window(model, paragraphed_text)
+
+                relevant_examples = training_store.find_nearest_neighbors(
+                    combined_embedding[-1],  # Use last token's embedding
+                    k=num_neighbors
+                )
+
+                # Print relevant examples
+                print_relevant_examples(relevant_examples)
+                print("=" * 60)

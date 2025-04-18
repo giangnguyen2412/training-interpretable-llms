@@ -43,7 +43,7 @@ always_save_checkpoint = True # if True, always save a checkpoint after each eva
 init_from = 'scratch' # 'scratch' or 'resume' or 'gpt2*'
 # wandb logging
 wandb_log = True # disabled by default
-wandb_project = 'nanoGPT'
+wandb_project = 'owt'
 wandb_run_name = f'gpt2_{time.strftime("%Y%m%d_%H%M%S")}'
 wandb_tags = ['nn_attribution']
 
@@ -105,7 +105,6 @@ else:
     ddp_world_size = 1
 tokens_per_iter = gradient_accumulation_steps * ddp_world_size * batch_size * block_size
 print(f"tokens per iteration will be: {tokens_per_iter:,}")
-
 
 if wandb_log and master_process:
     import wandb
@@ -389,6 +388,7 @@ while True:
 
     # termination conditions
     if iter_num > max_iters:
+        print(f"The best validation loss is {best_val_loss}")
         break
 
 if ddp:
