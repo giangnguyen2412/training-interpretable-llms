@@ -1,7 +1,7 @@
 
 # nanoGPT with explanations
 
-![assets/img.png](assets/img.png)
+![assets/dissect.png](assets/dissect.png)
 
 ## quick start
 
