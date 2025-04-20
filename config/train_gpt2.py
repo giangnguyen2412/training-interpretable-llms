@@ -3,8 +3,15 @@
 # $ torchrun --standalone --nproc_per_node=8 train.py config/train_gpt2.py
 
 wandb_log = True
-wandb_project = 'owt'
+out_dir = 'out-owt-gpt2'
+
+wandb_project = 'open-web-text'
 wandb_run_name='gpt2-124M'
+
+dataset = 'openwebtext'
+
+init_from = 'gpt2' # this is the largest GPT-2 model
+
 
 # these make the total batch size be ~0.5M
 # 12 batch size * 1024 block size * 5 gradaccum * 8 GPUs = 491,520
@@ -17,7 +24,7 @@ max_iters = 600000
 lr_decay_iters = 600000
 
 # eval stuff
-eval_interval = 1000
+eval_interval = 50
 eval_iters = 200
 log_interval = 10
 

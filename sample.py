@@ -1,6 +1,3 @@
-"""
-Sample from a trained model
-"""
 import os
 import pickle
 from contextlib import nullcontext
@@ -13,253 +10,209 @@ from tqdm import tqdm
 import numpy as np
 
 # -----------------------------------------------------------------------------
-init_from = 'resume' # either 'resume' (from an out_dir) or a gpt2 variant (e.g. 'gpt2-xl')
-out_dir = 'out_training_attribution' # ignored if init_from is not 'resume'
-# start = "\n" # or "<|endoftext|>" or etc. Can also specify a file, use as: "FILE:prompt.txt"
-start = "Tell me the difference between chicken and duck!\n" # or "<|endoftext|>" or etc. Can also specify a file, use as: "FILE:prompt.txt"
-num_samples = 5 # number of samples to draw
-max_new_tokens = 500 # number of tokens generated in each sample
-temperature = 0.8 # 1.0 = no change, < 1.0 = less random, > 1.0 = more random, in predictions
-top_k = 200 # retain only the top_k most likely tokens, clamp others to have 0 probability
-seed = 1337
-device = 'cuda' # examples: 'cpu', 'cuda', 'cuda:0', 'cuda:1', etc.
-dtype = 'bfloat16' if torch.cuda.is_available() and torch.cuda.is_bf16_supported() else 'float16' # 'float32' or 'bfloat16' or 'float16'
-compile = False # use PyTorch 2.0 to compile the model to be faster
+# DDP setup
+from torch.distributed import init_process_group, destroy_process_group
+from torch.nn.parallel import DistributedDataParallel as DDP
 
-training_data_attribution = False
-# exec(open('configurator.py').read()) # overrides from command line or config file
+ddp = int(os.environ.get('RANK', -1)) != -1
+if ddp:
+    init_process_group(backend='nccl')
+    rank = int(os.environ['RANK'])
+    local_rank = int(os.environ['LOCAL_RANK'])
+    world_size = int(os.environ['WORLD_SIZE'])
+    device = f'cuda:{local_rank}'
+    torch.cuda.set_device(local_rank)
+    master = (rank == 0)
+else:
+    rank = local_rank = 0
+    world_size = 1
+    device = 'cuda'
+    master = True
+
 # -----------------------------------------------------------------------------
+init_from = 'resume'  # 'resume' or 'gpt2*'
+# out_dir = 'out_training_attribution'
+out_dir = 'out-shakespeare-finetune'
+out_dir = 'out-owt-gpt2'
 
-torch.manual_seed(seed)
-torch.cuda.manual_seed(seed)
-torch.backends.cuda.matmul.allow_tf32 = True # allow tf32 on matmul
-torch.backends.cudnn.allow_tf32 = True # allow tf32 on cudnn
-device_type = 'cuda' if 'cuda' in device else 'cpu' # for later use in torch.autocast
-ptdtype = {'float32': torch.float32, 'bfloat16': torch.bfloat16, 'float16': torch.float16}[dtype]
+start = "Tell me about communism in Vietnam!\n"
+num_samples = 3
+max_new_tokens = 500
+temperature = 0.9
+top_k = 200
+seed = 1337
+dtype = 'bfloat16' if torch.cuda.is_available() and torch.cuda.is_bf16_supported() else 'float16'
+compile = False
+training_data_attribution = False
+
+# -----------------------------------------------------------------------------
+torch.manual_seed(seed + rank)
+torch.cuda.manual_seed(seed + rank)
+torch.backends.cuda.matmul.allow_tf32 = True
+torch.backends.cudnn.allow_tf32 = True
+device_type = 'cuda' if 'cuda' in device else 'cpu'
+ptdtype = {'float32': torch.float32,
+           'bfloat16': torch.bfloat16,
+           'float16': torch.float16}[dtype]
 ctx = nullcontext() if device_type == 'cpu' else torch.amp.autocast(device_type=device_type, dtype=ptdtype)
 
-# --------------------------------------------------------------------------
-
+# -----------------------------------------------------------------------------
 import hashlib
 import json
 
+def dprint(*args, **kwargs):
+    if master:
+        print(*args, **kwargs)
 
 def get_checkpoint_hash(checkpoint):
-    """Create a unique identifier for the checkpoint based on metadata"""
-    metadata = {
-        'val_loss': float(checkpoint['best_val_loss'].cpu().item()),
-        'model_args': checkpoint['model_args'],
-        'iter_num': checkpoint['iter_num'],
-        # Add other relevant metadata
-    }
-    # Create a stable string representation
+    metadata = {'val_loss': float(checkpoint['best_val_loss'].cpu().item()),
+                'model_args': checkpoint['model_args'],
+                'iter_num': checkpoint['iter_num']}
     metadata_str = json.dumps(metadata, sort_keys=True)
-    # Create hash
     return hashlib.md5(metadata_str.encode()).hexdigest()
 
-
 def get_cache_path(checkpoint):
-    """Get path for cached embeddings"""
     cache_dir = 'embedding_cache'
     os.makedirs(cache_dir, exist_ok=True)
+    return os.path.join(cache_dir, f"embeddings_{get_checkpoint_hash(checkpoint)}.pkl")
 
-    checkpoint_hash = get_checkpoint_hash(checkpoint)
-    return os.path.join(cache_dir, f'embeddings_{checkpoint_hash}.pkl')
-
-
-def load_or_compute_embeddings(model, training_data, checkpoint):
-    """Load cached embeddings or compute new ones"""
+# -----------------------------------------------------------------------------
+def load_or_compute_embeddings(model_ref, training_data, checkpoint):
     cache_path = get_cache_path(checkpoint)
-
-    # Try to load from cache
     if os.path.exists(cache_path):
-        print(f"Loading cached embeddings from {cache_path}")
+        dprint(f"Loading cached embeddings from {cache_path}")
         with open(cache_path, 'rb') as f:
             return pickle.load(f)
-
-    # Compute fresh embeddings
-    print("Computing fresh embeddings...")
-    training_store = compute_training_store(model, training_data)
-
-    # Cache the results
-    print(f"Caching embeddings to {cache_path}")
+    dprint("Computing fresh embeddings...")
+    training_store = compute_training_store(model_ref, training_data)
+    dprint(f"Caching embeddings to {cache_path}")
     with open(cache_path, 'wb') as f:
         pickle.dump(training_store, f)
-
     return training_store
 
-
 # -----------------------------------------------------------------------------
-
-num_neighbors = 3  # Number of relevant examples to show
-
-# -----------------------------------------------------------------------------
+num_neighbors = 3
 
 def print_relevant_examples(examples):
-    """Print relevant training examples"""
+    if not master:
+        return
     print("\nMost relevant training examples:")
     for idx, example in enumerate(examples, 1):
-        # Clean up or truncate the example if needed
-        clean_text = decode(example)  # Limit length to avoid huge outputs
+        clean_text = decode(example)
         print(f"\n{idx}. Example text:")
         print(clean_text)
         print("-" * 40)
 
-
-
-# Add this after model loading and before generation
+# -----------------------------------------------------------------------------
 def load_training_data():
-    """Load the training data from the checkpoint's config"""
     if 'config' not in checkpoint or 'dataset' not in checkpoint['config']:
-        raise ValueError("Checkpoint doesn't contain dataset configuration")
-
+        raise ValueError("Checkpoint missing dataset config")
     dataset_path = os.path.join('data', checkpoint['config']['dataset'], 'train.bin')
-    if not os.path.exists(dataset_path):
-        raise FileNotFoundError(f"Training data not found at {dataset_path}")
+    return np.memmap(dataset_path, dtype=np.uint16, mode='r')
 
-    # Load the binary data
-    data = np.memmap(dataset_path, dtype=np.uint16, mode='r')
-    return data
-
-def compute_training_store(model, data, chunk_size=256):
-    """Compute fresh embeddings for training data"""
-    print("Computing new training store...")
+# -----------------------------------------------------------------------------
+def compute_training_store(model_ref, data, chunk_size=256):
     training_store = TrainingDataStore()
-
-    # Calculate total number of chunks
     total_chunks = (len(data) - 1) // chunk_size + 1
-
-    # Process data in chunks with progress bar
-    with tqdm(total=total_chunks, desc="Computing embeddings") as pbar:
-        for i in range(0, len(data) - chunk_size, chunk_size):
-            chunk = data[i:i + chunk_size]
-            input_ids = torch.tensor(chunk, dtype=torch.long, device=device)[None, ...]
-
-            with torch.no_grad():
-                with ctx:
-                    input_ids = input_ids.cuda()
-                    _, _, embedding = model(input_ids)
-                    # Store the chunk and its embedding
-                    training_store.add_example(chunk.tolist(), embedding[-1].cpu())
-
+    if master:
+        pbar = tqdm(total=total_chunks, desc="Computing embeddings")
+    for idx in range(total_chunks):
+        if ddp and idx % world_size != rank:
+            continue
+        start_i = idx * chunk_size
+        end_i = min(start_i + chunk_size, len(data))
+        chunk = data[start_i:end_i]
+        input_ids = torch.tensor(chunk, dtype=torch.long, device=device)[None, ...]
+        with torch.no_grad():
+            with ctx:
+                _, _, emb = model_ref(input_ids)
+        training_store.add_example(chunk.tolist(), emb[-1].cpu())
+        if master:
             pbar.update(1)
-
+    if master:
+        pbar.close()
+    if ddp:
+        torch.distributed.barrier()
     return training_store
 
-###########################################################################
-
-# model
+# -----------------------------------------------------------------------------
+# MODEL LOADING
 if init_from == 'resume':
-    # init from a model saved in a specific directory
-    ckpt_path = os.path.join(out_dir, 'ckpt.pt')
-    print(f"Loading model from {ckpt_path}")
-    checkpoint = torch.load(ckpt_path, map_location=device)
+    ckpt_path = os.path.join(out_dir, 'original.pt')
+    dprint(f"Loading model from {ckpt_path}")
+    checkpoint = torch.load(ckpt_path, map_location='cpu')
     gptconf = GPTConfig(**checkpoint['model_args'])
     model = GPT(gptconf)
     state_dict = checkpoint['model']
-    data_store = checkpoint['data_store']
-
-    print(f"best validation loss was {checkpoint['best_val_loss']}")
-
-    unwanted_prefix = '_orig_mod.'
-    for k,v in list(state_dict.items()):
-        if k.startswith(unwanted_prefix):
-            state_dict[k[len(unwanted_prefix):]] = state_dict.pop(k)
+    for k, v in list(state_dict.items()):
+        if k.startswith('_orig_mod.'):
+            state_dict[k[len('_orig_mod.'):]] = state_dict.pop(k)
     model.load_state_dict(state_dict)
-    model = torch.nn.DataParallel(model, device_ids=range(4))
-
-    if training_data_attribution is True:
-        # Compute fresh training store
-        try:
-            training_data = load_training_data()
-            model = model.cuda()
-            model = torch.nn.DataParallel(model, device_ids=range(4))
-            # training_store = compute_training_store(model, training_data)
-            training_store = load_or_compute_embeddings(model, training_data, checkpoint)
-        except Exception as e:
-            print(f"Warning: Could not compute fresh training store: {e}")
-            print("Falling back to stored training store")
-            training_store = data_store
-elif init_from.startswith('gpt2'):
-    # init from a given GPT-2 model
+    if training_data_attribution:
+        data = load_training_data()
+        model.to(device)
+else:
     model = GPT.from_pretrained(init_from, dict(dropout=0.0))
-
-    if training_data_attribution is True:
-        training_store = TrainingDataStore()
+    if training_data_attribution:
+        data = None
 
 model.eval()
 model.to(device)
-if compile:
-    model = torch.compile(model) # requires PyTorch 2.0 (optional)
 
-# look for the meta pickle in case it is available in the dataset folder
+# wrap in DDP if requested
+if ddp:
+    model = DDP(model, device_ids=[local_rank])
+# unwrap for generation and embedding functions
+gen_model = model.module if ddp else model
+
+if compile:
+    gen_model = torch.compile(gen_model)
+
+# ENCODER SETUP
 load_meta = False
-if init_from == 'resume' and 'config' in checkpoint and 'dataset' in checkpoint['config']: # older checkpoints might not have these...
+if init_from == 'resume' and 'config' in checkpoint and 'dataset' in checkpoint['config']:
     meta_path = os.path.join('data', checkpoint['config']['dataset'], 'meta.pkl')
     load_meta = os.path.exists(meta_path)
 if load_meta:
-    print(f"Loading meta from {meta_path}...")
     with open(meta_path, 'rb') as f:
         meta = pickle.load(f)
-    # TODO want to make this more general to arbitrary encoder/decoder schemes
     stoi, itos = meta['stoi'], meta['itos']
     encode = lambda s: [stoi[c] for c in s]
     decode = lambda l: ''.join([itos[i] for i in l])
 else:
-    # ok let's assume gpt-2 encodings by default
-    print("No meta.pkl found, assuming GPT-2 encodings...")
     enc = tiktoken.get_encoding("gpt2")
     encode = lambda s: enc.encode(s, allowed_special={"<|endoftext|>"})
     decode = lambda l: enc.decode(l)
 
+# Compute or load embeddings
+if training_data_attribution and init_from == 'resume':
+    training_store = load_or_compute_embeddings(gen_model, data, checkpoint)
 
-# Load training store
-# training_store = data_store
+# GENERATION (master only)
+if master:
+    if start.startswith('FILE:'):
+        with open(start[5:], 'r', encoding='utf-8') as f:
+            start = f.read()
+    start_ids = encode(start)
+    x = torch.tensor(start_ids, dtype=torch.long, device=device)[None, ...]
+    dprint(f"\nPrompt: {start}")
+    with torch.no_grad():
+        with ctx:
+            for k in range(num_samples):
+                dprint(f"\n******************************************************")
+                dprint(f"\nSample {k+1}:")
+                y = gen_model.generate(x, max_new_tokens, temperature=temperature, top_k=top_k)
+                dprint("\nGenerated text:")
+                dprint(decode(y[0].tolist()))
 
-# encode the beginning of the prompt
-if start.startswith('FILE:'):
-    with open(start[5:], 'r', encoding='utf-8') as f:
-        start = f.read()
-start_ids = encode(start)
-x = (torch.tensor(start_ids, dtype=torch.long, device=device)[None, ...])
+                if training_data_attribution:
+                    combined = torch.cat([x, y], dim=1)
+                    emb = combined[:, -gen_model.config.block_size:]
+                    combined_emb = emb.mean(dim=1)
+                    examples = training_store.find_nearest_neighbors(combined_emb, k=num_neighbors)
+                    print_relevant_examples(examples)
+                    dprint("=" * 60)
 
-def get_embedding_with_window(model, tensor, window_size=256):
-    embeddings = []
-    for i in range(0, tensor.size(1), window_size):
-        window = tensor[:, i:i + window_size]
-        _, _, emb = model(window)
-        embeddings.append(emb[-1])
-    # Combine embeddings (e.g., average them)
-    return torch.stack(embeddings).mean(dim=0)
-
-
-# Generate with attribution
-print(f"\nPrompt: {start}")
-with torch.no_grad():
-    with ctx:
-        for k in range(num_samples):
-            print(f"\nSample {k + 1}:")
-
-            # Generate text
-            y = model.generate(x, max_new_tokens, temperature=temperature, top_k=top_k)
-
-            # Print generated text
-            print("\nGenerated text:")
-            print(decode(y[0].tolist()))
-
-            if training_data_attribution is True:
-
-                # combine input and generated text
-                paragraphed_text = torch.cat([x, y], dim=1)
-
-                # use this combined text to retrieve the relevant examples
-                combined_embedding = get_embedding_with_window(model, paragraphed_text)
-
-                relevant_examples = training_store.find_nearest_neighbors(
-                    combined_embedding[-1],  # Use last token's embedding
-                    k=num_neighbors
-                )
-
-                # Print relevant examples
-                print_relevant_examples(relevant_examples)
-                print("=" * 60)
+# CLEANUP
+if ddp:
+    destroy_process_group()

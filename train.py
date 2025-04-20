@@ -42,14 +42,14 @@ eval_only = False # if True, script exits right after the first eval
 always_save_checkpoint = True # if True, always save a checkpoint after each eval
 init_from = 'scratch' # 'scratch' or 'resume' or 'gpt2*'
 # wandb logging
-wandb_log = True # disabled by default
-wandb_project = 'owt'
-wandb_run_name = f'gpt2_{time.strftime("%Y%m%d_%H%M%S")}'
+# wandb_log = True # disabled by default
+# wandb_project = 'owt'
+# wandb_run_name = f'gpt2_{time.strftime("%Y%m%d_%H%M%S")}'
 wandb_tags = ['nn_attribution']
 
 # data
-dataset = 'openwebtext'
-# dataset = 'shakespeare_char'
+# dataset = 'openwebtext'
+dataset = 'shakespeare_char'
 gradient_accumulation_steps = 5 * 8 # used to simulate larger batch sizes
 batch_size = 12 # if gradient_accumulation_steps > 1, this is the micro-batch size
 block_size = 1024
@@ -77,6 +77,10 @@ backend = 'nccl' # 'nccl', 'gloo', etc.
 device = 'cuda' # examples: 'cpu', 'cuda', 'cuda:0', 'cuda:1' etc., or try 'mps' on macbooks
 dtype = 'bfloat16' if torch.cuda.is_available() and torch.cuda.is_bf16_supported() else 'float16' # 'float32', 'bfloat16', or 'float16', the latter will auto implement a GradScaler
 compile = True # use PyTorch 2.0 to compile the model to be faster
+
+
+
+## CONFIGURATIONS
 # -----------------------------------------------------------------------------
 config_keys = [k for k,v in globals().items() if not k.startswith('_') and isinstance(v, (int, float, bool, str))]
 exec(open('configurator.py').read()) # overrides from command line or config file
@@ -151,6 +155,23 @@ data_dir = os.path.join('data', dataset)
 # Create memmap objects at the start
 train_data = np.memmap(os.path.join(data_dir, 'train.bin'), dtype=np.uint16, mode='r')
 val_data = np.memmap(os.path.join(data_dir, 'val.bin'), dtype=np.uint16, mode='r')
+
+def format_training_progress(iter_num, loss, dt, running_mfu, max_iters):
+    progress = (iter_num / max_iters) * 100
+    remaining_iters = max_iters - iter_num
+    time_per_iter = dt  # in seconds
+    remaining_time = remaining_iters * time_per_iter
+
+    # Convert to hours, minutes, seconds
+    hours = int(remaining_time // 3600)
+    minutes = int((remaining_time % 3600) // 60)
+    seconds = int(remaining_time % 60)
+
+    return (f"iter {iter_num}/{max_iters} ({progress:.2f}%): "
+            f"loss {loss:.4f}, "
+            f"time {dt * 1000:.2f}ms, "
+            f"mfu {running_mfu * 100:.2f}%, "
+            f"remaining time: {hours}h {minutes}m {seconds}s")
 
 # Modify the get_batch function to return text as well:
 def get_batch(split):
@@ -240,7 +261,9 @@ if block_size < model.config.block_size:
     model_args['block_size'] = block_size # so that the checkpoint will have the right value
 model.to(device)
 
-data_store = TrainingDataStore() if master_process else None
+print(f"Using Flash Attention: {model.transformer.h[0].attn.flash}")
+
+# data_store = TrainingDataStore() if master_process else None
 
 # initialize a GradScaler. If enabled=False scaler is a no-op
 scaler = torch.cuda.amp.GradScaler(enabled=(dtype == 'float16'))
@@ -302,6 +325,7 @@ t0 = time.time()
 local_iter_num = 0 # number of iterations in the lifetime of this process
 raw_model = model.module if ddp else model # unwrap DDP container if needed
 running_mfu = -1.0
+
 while True:
 
     # determine and set the learning rate for this iteration
@@ -319,7 +343,7 @@ while True:
                 "train/loss": losses['train'],
                 "val/loss": losses['val'],
                 "lr": lr,
-                "mfu": running_mfu*100, # convert to percentage
+                "hardware_util": running_mfu*100, # convert to percentage
             })
         if losses['val'] < best_val_loss or always_save_checkpoint:
             best_val_loss = losses['val']
@@ -331,7 +355,8 @@ while True:
                     'iter_num': iter_num,
                     'best_val_loss': best_val_loss,
                     'config': config,
-                    'data_store': data_store if data_store is not None else None,
+                    # 'data_store': data_store if data_store is not None else None,
+                    'dataset': dataset,
                 }
                 print(f"saving checkpoint to {out_dir}")
                 torch.save(checkpoint, os.path.join(out_dir, 'ckpt.pt'))
@@ -352,10 +377,11 @@ while True:
             logits, loss, embeddings = model(X, Y)
             loss = loss / gradient_accumulation_steps # scale the loss to account for gradient accumulation
 
-        if master_process and data_store is not None:
-            for i in range(len(texts)):
-                # Ensure the text is properly decoded if needed
-                data_store.add_example(texts[i], embeddings[i])
+        # LETS NOT COMPUTE EMBEDDING DURING TRAINING
+        # if master_process and data_store is not None:
+        #     for i in range(len(texts)):
+        #         # Ensure the text is properly decoded if needed
+        #         data_store.add_example(texts[i], embeddings[i])
 
         # immediately async prefetch next batch while model is doing the forward pass on the GPU
         X, Y, texts = get_batch('train')
@@ -375,14 +401,18 @@ while True:
     t1 = time.time()
     dt = t1 - t0
     t0 = t1
+    # Replace the existing logging section with this:
     if iter_num % log_interval == 0 and master_process:
         # get loss as float. note: this is a CPU-GPU sync point
-        # scale up to undo the division above, approximating the true total loss (exact would have been a sum)
         lossf = loss.item() * gradient_accumulation_steps
-        if local_iter_num >= 5: # let the training loop settle a bit
+        if local_iter_num >= 5:  # let the training loop settle a bit
             mfu = raw_model.estimate_mfu(batch_size * gradient_accumulation_steps, dt)
-            running_mfu = mfu if running_mfu == -1.0 else 0.9*running_mfu + 0.1*mfu
-        print(f"iter {iter_num}: loss {lossf:.4f}, time {dt*1000:.2f}ms, mfu {running_mfu*100:.2f}%")
+            running_mfu = mfu if running_mfu == -1.0 else 0.9 * running_mfu + 0.1 * mfu
+
+        # Use the new formatting function
+        progress_str = format_training_progress(iter_num, lossf, dt, running_mfu, max_iters)
+        print(progress_str)
+
     iter_num += 1
     local_iter_num += 1
 
