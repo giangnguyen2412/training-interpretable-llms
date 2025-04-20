@@ -8,6 +8,9 @@ from training_store import TrainingDataStore
 from torch.utils.data import Dataset, DataLoader
 from tqdm import tqdm
 import numpy as np
+from collections import Counter
+import json
+import sys
 
 # -----------------------------------------------------------------------------
 # DDP setup
@@ -30,22 +33,38 @@ else:
     master = True
 
 # -----------------------------------------------------------------------------
+# Configuration flags
 init_from = 'resume'  # 'resume' or 'gpt2*'
-# out_dir = 'out_training_attribution'
-out_dir = 'out-shakespeare-finetune'
 out_dir = 'out-owt-gpt2'
 
-start = "Tell me about communism in Vietnam!\n"
-num_samples = 3
+
+num_samples = 1  # Generate 3 answers per prompt
 max_new_tokens = 500
 temperature = 0.9
 top_k = 200
 seed = 1337
+# bfloat16 support check
 dtype = 'bfloat16' if torch.cuda.is_available() and torch.cuda.is_bf16_supported() else 'float16'
 compile = False
 training_data_attribution = False
 
+###
+### The neuron trace procedure efficiently identifies the most
+# influential neurons during model generation by attaching forward hooks
+# to each transformer layer that capture per-neuron activations for each new token.
+# As the model generates text autoregressively, these hooks record activations
+# at each timestep. After generation completes, the algorithm computes each
+# neuron's average activation across all tokens, then ranks and selects the
+# top K most active neurons as the "trace."
+###
+# Flags for neuron tracing
+neuron_trace = True
+neuron_trace_topk = 10  # number of top activations to record
+concept_name = "tulip"  # Default concept
+prompts_file = f"{concept_name}.json"  # JSON file containing concept-related prompts
+
 # -----------------------------------------------------------------------------
+# Set random seeds and precision context
 torch.manual_seed(seed + rank)
 torch.cuda.manual_seed(seed + rank)
 torch.backends.cuda.matmul.allow_tf32 = True
@@ -57,26 +76,35 @@ ptdtype = {'float32': torch.float32,
 ctx = nullcontext() if device_type == 'cpu' else torch.amp.autocast(device_type=device_type, dtype=ptdtype)
 
 # -----------------------------------------------------------------------------
+# Utility functions
 import hashlib
 import json
+
 
 def dprint(*args, **kwargs):
     if master:
         print(*args, **kwargs)
 
+
 def get_checkpoint_hash(checkpoint):
-    metadata = {'val_loss': float(checkpoint['best_val_loss'].cpu().item()),
-                'model_args': checkpoint['model_args'],
-                'iter_num': checkpoint['iter_num']}
+    metadata = {
+        'val_loss': float(checkpoint['best_val_loss'].cpu().item()),
+        'model_args': checkpoint['model_args'],
+        'iter_num': checkpoint['iter_num']
+    }
     metadata_str = json.dumps(metadata, sort_keys=True)
     return hashlib.md5(metadata_str.encode()).hexdigest()
+
 
 def get_cache_path(checkpoint):
     cache_dir = 'embedding_cache'
     os.makedirs(cache_dir, exist_ok=True)
     return os.path.join(cache_dir, f"embeddings_{get_checkpoint_hash(checkpoint)}.pkl")
 
+
 # -----------------------------------------------------------------------------
+# Data attribution helpers
+# ----------------------------------------------------------------------------
 def load_or_compute_embeddings(model_ref, training_data, checkpoint):
     cache_path = get_cache_path(checkpoint)
     if os.path.exists(cache_path):
@@ -90,8 +118,9 @@ def load_or_compute_embeddings(model_ref, training_data, checkpoint):
         pickle.dump(training_store, f)
     return training_store
 
-# -----------------------------------------------------------------------------
+
 num_neighbors = 3
+
 
 def print_relevant_examples(examples):
     if not master:
@@ -103,14 +132,14 @@ def print_relevant_examples(examples):
         print(clean_text)
         print("-" * 40)
 
-# -----------------------------------------------------------------------------
+
 def load_training_data():
     if 'config' not in checkpoint or 'dataset' not in checkpoint['config']:
         raise ValueError("Checkpoint missing dataset config")
     dataset_path = os.path.join('data', checkpoint['config']['dataset'], 'train.bin')
     return np.memmap(dataset_path, dtype=np.uint16, mode='r')
 
-# -----------------------------------------------------------------------------
+
 def compute_training_store(model_ref, data, chunk_size=256):
     training_store = TrainingDataStore()
     total_chunks = (len(data) - 1) // chunk_size + 1
@@ -135,8 +164,10 @@ def compute_training_store(model_ref, data, chunk_size=256):
         torch.distributed.barrier()
     return training_store
 
+
 # -----------------------------------------------------------------------------
 # MODEL LOADING
+# -----------------------------------------------------------------------------
 if init_from == 'resume':
     ckpt_path = os.path.join(out_dir, 'original.pt')
     dprint(f"Loading model from {ckpt_path}")
@@ -144,13 +175,12 @@ if init_from == 'resume':
     gptconf = GPTConfig(**checkpoint['model_args'])
     model = GPT(gptconf)
     state_dict = checkpoint['model']
-    for k, v in list(state_dict.items()):
+    for k in list(state_dict.keys()):
         if k.startswith('_orig_mod.'):
             state_dict[k[len('_orig_mod.'):]] = state_dict.pop(k)
     model.load_state_dict(state_dict)
     if training_data_attribution:
         data = load_training_data()
-        model.to(device)
 else:
     model = GPT.from_pretrained(init_from, dict(dropout=0.0))
     if training_data_attribution:
@@ -159,16 +189,15 @@ else:
 model.eval()
 model.to(device)
 
-# wrap in DDP if requested
 if ddp:
     model = DDP(model, device_ids=[local_rank])
-# unwrap for generation and embedding functions
 gen_model = model.module if ddp else model
-
 if compile:
     gen_model = torch.compile(gen_model)
 
+# -----------------------------------------------------------------------------
 # ENCODER SETUP
+# -----------------------------------------------------------------------------
 load_meta = False
 if init_from == 'resume' and 'config' in checkpoint and 'dataset' in checkpoint['config']:
     meta_path = os.path.join('data', checkpoint['config']['dataset'], 'meta.pkl')
@@ -184,34 +213,132 @@ else:
     encode = lambda s: enc.encode(s, allowed_special={"<|endoftext|>"})
     decode = lambda l: enc.decode(l)
 
-# Compute or load embeddings
 if training_data_attribution and init_from == 'resume':
     training_store = load_or_compute_embeddings(gen_model, data, checkpoint)
 
-# GENERATION (master only)
-if master:
-    if start.startswith('FILE:'):
-        with open(start[5:], 'r', encoding='utf-8') as f:
-            start = f.read()
-    start_ids = encode(start)
-    x = torch.tensor(start_ids, dtype=torch.long, device=device)[None, ...]
-    dprint(f"\nPrompt: {start}")
-    with torch.no_grad():
-        with ctx:
-            for k in range(num_samples):
-                dprint(f"\n******************************************************")
-                dprint(f"\nSample {k+1}:")
-                y = gen_model.generate(x, max_new_tokens, temperature=temperature, top_k=top_k)
-                dprint("\nGenerated text:")
-                dprint(decode(y[0].tolist()))
 
-                if training_data_attribution:
-                    combined = torch.cat([x, y], dim=1)
-                    emb = combined[:, -gen_model.config.block_size:]
-                    combined_emb = emb.mean(dim=1)
-                    examples = training_store.find_nearest_neighbors(combined_emb, k=num_neighbors)
-                    print_relevant_examples(examples)
-                    dprint("=" * 60)
+# -----------------------------------------------------------------------------
+# Hook function for neuron tracing
+# -----------------------------------------------------------------------------
+def make_hooks(activations):
+    hooks = []
+    try:
+        layers = gen_model.transformer.h
+    except AttributeError:
+        layers = getattr(gen_model, 'blocks', [])
+    for layer_idx, layer in enumerate(layers):
+        def hook_fn(module, inp, out, idx=layer_idx):
+            # capture last-token activations: [batch, hidden]
+            # the size of out will increase over time.
+            breakpoint()
+            last_act = out[:, -1, :].detach().squeeze(0)
+            for neuron_idx, val in enumerate(last_act.tolist()):
+                activations.setdefault((idx, neuron_idx), []).append(val)
+
+        hooks.append(layer.register_forward_hook(hook_fn))
+    return hooks
+
+
+# -----------------------------------------------------------------------------
+# GENERATION logic
+# -----------------------------------------------------------------------------
+if master:
+    # Read prompts from JSON file
+    if os.path.exists(prompts_file):
+        try:
+            with open(prompts_file, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+                prompts = data.get("prompts", [])
+                # If concept is in the file, use it; otherwise use filename
+                concept = data.get("concept", concept_name)
+        except json.JSONDecodeError:
+            dprint(f"Error: {prompts_file} is not a valid JSON file")
+            sys.exit(1)
+    else:
+        dprint(f"Error: {prompts_file} not found. Please create this file with prompts for the concept.")
+        sys.exit(1)
+
+    dprint(f"Loaded {len(prompts)} prompts for concept '{concept}'")
+
+    # Initialize counter for neuron occurrences
+    neuron_occurrences = Counter()
+
+    # Process each prompt
+    for prompt_idx, prompt in enumerate(prompts):
+        dprint(f"\n{'=' * 80}\nProcessing prompt {prompt_idx + 1}/{len(prompts)}:\n{prompt}\n{'=' * 80}")
+
+        start_ids = encode(prompt)
+        x = torch.tensor(start_ids, dtype=torch.long, device=device)[None, ...]
+
+        # Generate multiple samples per prompt
+        for k in range(num_samples):
+            dprint(f"\nGenerating sample {k + 1}/{num_samples} for prompt {prompt_idx + 1}")
+
+            activations = {}
+            hooks = make_hooks(activations)
+
+            with torch.no_grad():
+                y = gen_model.generate(
+                    x,
+                    max_new_tokens=max_new_tokens,
+                    temperature=temperature,
+                    top_k=top_k
+                )
+
+            for h in hooks:
+                h.remove()
+
+            # Average activations per neuron
+            records = []
+            for (layer_idx, neuron_idx), vals in activations.items():
+                avg_val = sum(vals) / len(vals)
+                records.append((layer_idx, neuron_idx, avg_val))
+
+            records.sort(key=lambda x: x[2], reverse=True)
+            top_records = records[:neuron_trace_topk]
+
+            # Count occurrences of each neuron in top-k
+            for layer, neuron, _ in top_records:
+                neuron_occurrences[(layer, neuron)] += 1
+
+            # Save individual trace data
+            concept_dir = os.path.join(out_dir, concept)
+            os.makedirs(concept_dir, exist_ok=True)
+            trace_path = os.path.join(concept_dir, f'neuron_trace_prompt_{prompt_idx + 1}_sample_{k + 1}.pkl')
+            with open(trace_path, 'wb') as f:
+                pickle.dump({'prompt': prompt, 'prompt_idx': prompt_idx + 1, 'sample': k + 1, 'trace': top_records}, f)
+
+            # Output sample generation text
+            dprint(f"\nGenerated text (sample {k + 1}):")
+            dprint(decode(y[0].tolist()))
+
+    # Identify the most consistent "concept neurons"
+    max_possible_occurrences = len(prompts) * num_samples
+    dprint(f"\n{'=' * 80}\nMost consistent {concept} neurons\n{'=' * 80}")
+    dprint(f"Total prompts: {len(prompts)}, samples per prompt: {num_samples}")
+    dprint(f"Maximum possible occurrences: {max_possible_occurrences}")
+
+    top_neurons = neuron_occurrences.most_common(neuron_trace_topk)
+    dprint(f"\nTop {neuron_trace_topk} neurons most consistently activated by {concept} content:")
+    dprint("Rank  Layer  Neuron  Occurrences  % of Samples")
+
+    for rank, ((layer, neuron), count) in enumerate(top_neurons, 1):
+        percentage = (count / max_possible_occurrences) * 100
+        dprint(f"{rank:4d}  {layer:5d}  {neuron:6d}  {count:11d}  {percentage:11.2f}%")
+
+    # Save the overall results
+    concept_neurons_path = os.path.join(concept_dir, f'{concept}_neurons.pkl')
+    with open(concept_neurons_path, 'wb') as f:
+        pickle.dump({
+            'concept': concept,
+            'neuron_occurrences': dict(neuron_occurrences),
+            'top_neurons': top_neurons,
+            'prompts': prompts,
+            'num_samples': num_samples,
+            'max_occurrences': max_possible_occurrences
+        }, f)
+
+    dprint(f"\n{concept.capitalize()} neuron analysis complete! Results saved to {concept_neurons_path}")
 
 # CLEANUP
 if ddp:
