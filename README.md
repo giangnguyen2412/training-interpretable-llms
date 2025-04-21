@@ -191,8 +191,8 @@ Note that the code by default uses [PyTorch 2.0](https://pytorch.org/get-started
 
 ## acknowledgements
 
-Andrej Karpathy for his amazing nanoGPT learning resources!
-This repository is a fork of [nanoGPT](https://github.com/karpathy/nanoGPT), with a focus on extracting explanations from the language model.
+Thanks Andrej Karpathy for his amazing nanoGPT learning resources!
+This repository is a just fork of [nanoGPT](https://github.com/karpathy/nanoGPT), with a focus on extracting explanations from the language model.
 ## discussions
 
 > Why loss values of training and validation often have values in range of 2-3.
@@ -229,7 +229,7 @@ loss = -log(probability_of_correct_token)  # log == ln or natural logarithm
 
 ## training insights
 
-### adding training data attribution
+### corroborative training data attribution (kNN)
 
 - Insight 1 – Decoding Tokenized Texts
 
@@ -320,6 +320,10 @@ Falling back to stored training store
 > However, as the LLMs are not trained for any retrieval tasks, the embedding here is not meaningful for similarity retrieval (or at least not working well with cosine function).
 > Indeed, if using BLMs, and a sense vector having the concept of "toxic". We can leverage the sense vector to retrieve the training data NNs and remove them.
 > In this case, the sense vectors may have "cleaner" representations of "toxic" than the token embeddings.
+
+
+### neuron tracing
+
 
 - Insight 10: Can we trace neurons that highly activate during the generation process? During multiple forward pass, we may be able to identify the role of specific neurons.
 
