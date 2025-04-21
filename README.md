@@ -79,6 +79,9 @@ Finally, on Apple Silicon Macbooks and with a recent PyTorch version make sure t
 
 A more serious deep learning professional may be more interested in reproducing GPT-2 results. So here we go - we first tokenize the dataset, in this case the [OpenWebText](https://openwebtext2.readthedocs.io/en/latest/), an open reproduction of OpenAI's (private) WebText:
 
+![assets/gpt2.png](assets/gpt2.png) 
+
+
 ```sh
 python data/openwebtext/prepare.py
 ```
@@ -339,6 +342,10 @@ Falling back to stored training store
 > In this case, the sense vectors may have "cleaner" representations of "toxic" than the token embeddings.
 
 - Insight 10: Can we trace neurons that highly activate during the generation process? During multiple forward pass, we may be able to identify the role of specific neurons.
+
+> The neuron tracing is focused on the hidden states of each transformer 
+> block because these are most commonly understood as the "neurons" in transformer 
+> models and tend to be where interpretable features are encoded.
 
 >  The neuron trace procedure efficiently identifies the most influential neurons during model generation by attaching forward hooks
 to each transformer layer that capture per-neuron activations for each new token.

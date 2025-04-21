@@ -62,6 +62,7 @@ neuron_trace = True
 neuron_trace_topk = 10  # number of top activations to record
 concept_name = "tulip"  # Default concept
 prompts_file = f"{concept_name}.json"  # JSON file containing concept-related prompts
+neuron_trace_all_positions = True  # Whether to trace all positions or just the last position
 
 # -----------------------------------------------------------------------------
 # Set random seeds and precision context
@@ -220,24 +221,82 @@ if training_data_attribution and init_from == 'resume':
 # -----------------------------------------------------------------------------
 # Hook function for neuron tracing
 # -----------------------------------------------------------------------------
+# def make_hooks(activations):
+#     hooks = []
+#     try:
+#         layers = gen_model.transformer.h
+#     except AttributeError:
+#         layers = getattr(gen_model, 'blocks', [])
+#     for layer_idx, layer in enumerate(layers):
+#         def hook_fn(module, inp, out, idx=layer_idx):
+#             # capture last-token activations: [batch, hidden]
+#             # the size of out will increase over time.
+#             breakpoint()
+#             last_act = out[:, -1, :].detach().squeeze(0)
+#             for neuron_idx, val in enumerate(last_act.tolist()):
+#                 activations.setdefault((idx, neuron_idx), []).append(val)
+#
+#         hooks.append(layer.register_forward_hook(hook_fn))
+#     return hooks
+
+# Modify the make_hooks function to trace all positions if requested
 def make_hooks(activations):
     hooks = []
     try:
         layers = gen_model.transformer.h
     except AttributeError:
         layers = getattr(gen_model, 'blocks', [])
+
+    # Print information about the number of neurons being inspected
+    total_layers = len(layers)
+    # Assuming the hidden size is the same for all layers, we can check the first layer
+    try:
+        if hasattr(layers[0], 'mlp'):
+            hidden_size = layers[0].mlp.c_proj.out_features
+        else:
+            # Try different attribute names depending on model architecture
+            hidden_size = getattr(layers[0], 'out_proj',
+                                  getattr(layers[0], 'output_dense',
+                                          getattr(layers[0], 'c_proj', None))).out_features
+    except (AttributeError, IndexError):
+        # If we can't determine it, use a placeholder
+        hidden_size = "unknown"
+
+    dprint(f"\nNeuron Trace Configuration:")
+    dprint(f"- Inspecting {total_layers} layers with approximately {hidden_size} neurons each")
+    dprint(f"- Total neurons to analyze: ~{total_layers * hidden_size if isinstance(hidden_size, int) else 'unknown'}")
+    dprint(f"- Will show top {neuron_trace_topk} most active neurons")
+    dprint(f"- Tracing {'all token positions' if neuron_trace_all_positions else 'only the last token position'}\n")
+
     for layer_idx, layer in enumerate(layers):
         def hook_fn(module, inp, out, idx=layer_idx):
-            # capture last-token activations: [batch, hidden]
-            # the size of out will increase over time.
-            breakpoint()
-            last_act = out[:, -1, :].detach().squeeze(0)
-            for neuron_idx, val in enumerate(last_act.tolist()):
-                activations.setdefault((idx, neuron_idx), []).append(val)
+            if neuron_trace_all_positions:
+                # Capture activations for all positions in the sequence
+                # Shape of out is [batch, sequence_length, hidden_size]
+                all_acts = out.detach().squeeze(0)  # Remove batch dimension
+
+                # Only look at newly generated tokens (skip prompt tokens)
+                # We can identify this by checking if the sequence length is greater than our prompt length
+                current_seq_len = all_acts.shape[0]
+                prompt_len = len(start_ids) if 'start_ids' in globals() else 0
+
+                if current_seq_len > prompt_len:
+                    # Process activations for all newly generated tokens
+                    new_tokens_acts = all_acts[prompt_len:]
+
+                    # For each neuron, add its activations for all new tokens
+                    for neuron_idx in range(all_acts.shape[1]):  # Loop over hidden dimension
+                        neuron_acts = new_tokens_acts[:, neuron_idx].tolist()
+                        for val in neuron_acts:
+                            activations.setdefault((idx, neuron_idx), []).append(val)
+            else:
+                # Original behavior: capture only last-token activations
+                last_act = out[:, -1, :].detach().squeeze(0)
+                for neuron_idx, val in enumerate(last_act.tolist()):
+                    activations.setdefault((idx, neuron_idx), []).append(val)
 
         hooks.append(layer.register_forward_hook(hook_fn))
     return hooks
-
 
 # -----------------------------------------------------------------------------
 # GENERATION logic
@@ -294,6 +353,7 @@ if master:
                 avg_val = sum(vals) / len(vals)
                 records.append((layer_idx, neuron_idx, avg_val))
 
+            dprint(f"\nAnalyzed activations for {len(records)} neurons")
             records.sort(key=lambda x: x[2], reverse=True)
             top_records = records[:neuron_trace_topk]
 
