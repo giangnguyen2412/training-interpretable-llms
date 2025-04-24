@@ -1,5 +1,8 @@
 {
   "prompts": [
+    "The quick brown fox jumps over the lazy dog."
+  ],
+  "prompts_orig": [
     "The quick brown fox jumps over the lazy dog.",
     "She opened the window to let in fresh air.",
     "He walked to the store in the afternoon.",
@@ -7,3 +10,4 @@
     "They studied quietly in the library."
   ]
 }
+

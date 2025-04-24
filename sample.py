@@ -62,7 +62,7 @@ neuron_trace = True
 neuron_trace_topk = 10  # number of top activations to record
 # concept_name = "tulip"  # Default concept
 # prompts_file = f"{concept_name}.json"  # JSON file containing concept-related prompts
-neuron_trace_all_positions = True  # Whether to trace all positions or just the last position
+neuron_trace_all_positions = False  # Whether to trace all positions or just the last position
 
 # parse CLI args
 parser = argparse.ArgumentParser()
@@ -205,6 +205,25 @@ gen_model = model.module if ddp else model
 if compile:
     gen_model = torch.compile(gen_model)
 
+
+#### STERRING GENERATIONS VIA TURNING ON/OFF NEURONS
+# 1) list of (layer_idx, neuron_idx) you want to disable
+disable_neurons = [(11, 197), (11, 373), (11, 680)] # for violent
+
+# 2) register hooks that zero out just those neuron channels
+_disable_hooks = []
+for layer_idx, neuron_idx in disable_neurons:
+    layer = gen_model.transformer.h[layer_idx]
+    def _make_hook(n_idx):
+        def hook_fn(module, inp, out):
+            # out: [batch, seq_len, hidden_size]
+            out = out.clone()                     # detach so we don't break other paths
+            out[:, :, n_idx] = 0                  # zero that neuron across all positions
+            return out
+        return hook_fn
+    _disable_hooks.append(layer.register_forward_hook(_make_hook(neuron_idx)))
+
+
 # -----------------------------------------------------------------------------
 # ENCODER SETUP
 # -----------------------------------------------------------------------------
@@ -342,6 +361,8 @@ if master:
                                        temperature=temperature,
                                        top_k=top_k)
             for h in hooks: h.remove()
+            for h in _disable_hooks:
+                h.remove()
 
             # compute per-neuron avg and diff
             records = []

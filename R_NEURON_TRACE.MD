@@ -1,7 +1,6 @@
 ### neuron tracing
 
-
-- Insight 10: Can we trace neurons that highly activate during the generation process? During multiple forward pass, we may be able to identify the role of specific neurons.
+#### Research question: Can we trace neurons that highly activate during the generation process? During multiple forward pass, we may be able to identify the role of specific neurons.
 
 > The neuron tracing is focused on the hidden states of each transformer 
 > block because these are most commonly understood as the "neurons" in transformer 
@@ -239,3 +238,62 @@ Rank  Layer  Neuron  Occurrences  %
 | ![Overlap1](assets/overlap1.png) | ![Overlap2](assets/overlap2.png) |
 
 > Wow!!! We clearly see the improvements. Now, concepts have more distinctive neurons.
+
+#### Research question: Can we base on the output of neuron tracing to steer the generation (e.g. turning on or off concept neurons).
+
+> Using the violent concept, we inspect one of the prompt:
+
+> What role do firearms play in patterns of violent violence in different countries?
+
+```markdown
+What role do firearms play in patterns of violent violence in different countries?
+
+In the United States, firearms are a major commercial product. Over time and in many places over time we will see the emergence of ways to make firearms more easily accessible, especially in places that are becoming more popular for recreational use. Gun ownership has also played a big role in the rise of national parks, especially in urban areas.[11][12][13][14] These areas or areas are essential to the growth of the firearm industry and these areas are in correlation with their cultural origins.
+
+In the USA, firearm ownership has become more common in the larger cities, particularly in the Northeast and Northeastern states. People tend to be less likely to own firearms in these cities, as they are more likely to reside elsewhere. In the New York metro area, it seems that New York residents have a higher rate of firearm ownership than did Los Angeles residents (76.8% versus 91.2% in 2012).[5]
+
+Source: Wikipedia
+
+Most of our population lives in a liberal urban setting such as Los Angeles, but there are also urban areas in Virginia and Illinois that are very conservative, and many areas that are very conservative have some firearm ownership. In the North of Europe, an urban population in large cities like Dresden, which is considered by the National Rifle Association to be well-respected in the firearms industry, is the norm. In the United Kingdom, gun ownership has increased a lot in Britain since the early 1900s (and also in Europe).[14]
+
+There are many places in America where gun ownership is common and the gun lobby is extremely influential. The NRA is the major lobby within the United States, and is strong (except when it considers violence for which it thinks it is not being represented). In this country because of this, the gun lobby is heavily centralized and in many cases there are many different sources of information available on which to draw their conclusions. It is even possible to use guns in a wide variety of situations.
+
+Source: Wikipedia
+
+In many of these jurisdictions, there is the police organization, which is overwhelmingly political, as well as the Gunners Rights Party. It is also very difficult to pick out many of the positions within the NRA that are supported by their membership. The most obvious position, of course, is the most effective.
+
+In Virginia, many gun owners get a strong political opinion in their communities at large — however, in certain counties, it is not so strong in other places. In
+
+```
+
+Lets see how the output becomes if we turn off the top-3 neuron concepts for violent.
+
+```markdown
+Most consistent violent neurons
+====================
+Max possible occurrences: 10
+Rank  Layer  Neuron  Occurrences  %
+   1     11     197            6   60.00%
+   2     11     373            5   50.00%
+   3     11     680            5   50.00%
+```
+
+```markdown
+In the United States, firearms are a major factor in violent crime and contributing to violent crime over and above domestic violence. However, domestic violence and other forms of violence contribute substantially to violence and are associated with disproportionate levels of domestic assault and rape. This paper reviews the relationship of domestic violence to national homicide data and concludes that regardless of the level of domestic assault, domestic violence and other forms of violence contribute substantially to the spread of violent crime.
+
+2. Conclusion
+
+Violence is one of the most common and violent crimes in the world. Nevertheless, the United States homicide rate is well below the rate of every other advanced capitalist nation. Moreover, domestic violence is a major cause of violence and contributes significantly to violent crime. In addition, domestic violence contributes significantly to violent crime, through its intensity and frequency. However, other factors that contribute to violence include its violence-related origins: homicide rates, population, rural areas, geographical areas, and level of educational attainment. This paper reviews the relationship of domestic violence to national homicide and provides useful information about the relationship between domestic violence and violent crime.
+
+3. References
+
+References
+
+1. Conley J, Haddock P, Smith C & Deakins J , Sexual violence and homicide in the United States , Journal of Ethnicity and Migration , 44 , 4 , (469) , .
+
+2. Sperry KJ , Violence in International Relations: How Violence Is Exploited , International Journal of International Relations , 10 , 4 , (404) , .
+```
+
+> Well, the steered generation is not bad. It means the top neurons we found do not heavily affect the generation of violence.
+> Is it time to conclude that neuron tracing is not effective? There could be many reasons:
+> (a) the neuron concepts are not monosematic. (b) we are tracing activations on all tokens but we should do it selectively on important generated tokens only to get a finer set of neurons.

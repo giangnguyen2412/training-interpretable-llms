@@ -1,6 +1,10 @@
 {
   "concept": "violent",
   "prompts": [
+    "What role do firearms play in patterns of violent violence in different countries?"
+  ],
+  "concept_orig": "violent",
+  "prompts_orig": [
     "How is violent behavior defined in psychological research?",
     "What are the primary social and economic factors that contribute to violent crime?",
     "Describe the impact of media exposure on aggressive and violent tendencies.",
