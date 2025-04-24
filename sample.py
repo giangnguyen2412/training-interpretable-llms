@@ -11,6 +11,7 @@ import numpy as np
 from collections import Counter
 import json
 import sys
+import argparse
 
 # -----------------------------------------------------------------------------
 # DDP setup
@@ -37,7 +38,6 @@ else:
 init_from = 'resume'  # 'resume' or 'gpt2*'
 out_dir = 'out-owt-gpt2'
 
-
 num_samples = 1  # Generate 3 answers per prompt
 max_new_tokens = 500
 temperature = 0.9
@@ -60,9 +60,19 @@ training_data_attribution = False
 # Flags for neuron tracing
 neuron_trace = True
 neuron_trace_topk = 10  # number of top activations to record
-concept_name = "tulip"  # Default concept
-prompts_file = f"{concept_name}.json"  # JSON file containing concept-related prompts
+# concept_name = "tulip"  # Default concept
+# prompts_file = f"{concept_name}.json"  # JSON file containing concept-related prompts
 neuron_trace_all_positions = True  # Whether to trace all positions or just the last position
+
+# parse CLI args
+parser = argparse.ArgumentParser()
+parser.add_argument('--concept_name', type=str, default='tulip',
+                    help='Name of the concept (also used to find <concept>.json)')
+args = parser.parse_args()
+concept_name = args.concept_name
+prompts_file = f"{concept_name}.json"
+print(f"The concept we are interested in is {concept_name}")
+
 
 # -----------------------------------------------------------------------------
 # Set random seeds and precision context
@@ -79,7 +89,6 @@ ctx = nullcontext() if device_type == 'cpu' else torch.amp.autocast(device_type=
 # -----------------------------------------------------------------------------
 # Utility functions
 import hashlib
-import json
 
 
 def dprint(*args, **kwargs):
@@ -217,29 +226,9 @@ else:
 if training_data_attribution and init_from == 'resume':
     training_store = load_or_compute_embeddings(gen_model, data, checkpoint)
 
-
 # -----------------------------------------------------------------------------
 # Hook function for neuron tracing
 # -----------------------------------------------------------------------------
-# def make_hooks(activations):
-#     hooks = []
-#     try:
-#         layers = gen_model.transformer.h
-#     except AttributeError:
-#         layers = getattr(gen_model, 'blocks', [])
-#     for layer_idx, layer in enumerate(layers):
-#         def hook_fn(module, inp, out, idx=layer_idx):
-#             # capture last-token activations: [batch, hidden]
-#             # the size of out will increase over time.
-#             breakpoint()
-#             last_act = out[:, -1, :].detach().squeeze(0)
-#             for neuron_idx, val in enumerate(last_act.tolist()):
-#                 activations.setdefault((idx, neuron_idx), []).append(val)
-#
-#         hooks.append(layer.register_forward_hook(hook_fn))
-#     return hooks
-
-# Modify the make_hooks function to trace all positions if requested
 def make_hooks(activations):
     hooks = []
     try:
@@ -247,158 +236,167 @@ def make_hooks(activations):
     except AttributeError:
         layers = getattr(gen_model, 'blocks', [])
 
-    # Print information about the number of neurons being inspected
     total_layers = len(layers)
-    # Assuming the hidden size is the same for all layers, we can check the first layer
     try:
         if hasattr(layers[0], 'mlp'):
             hidden_size = layers[0].mlp.c_proj.out_features
         else:
-            # Try different attribute names depending on model architecture
             hidden_size = getattr(layers[0], 'out_proj',
                                   getattr(layers[0], 'output_dense',
                                           getattr(layers[0], 'c_proj', None))).out_features
     except (AttributeError, IndexError):
-        # If we can't determine it, use a placeholder
         hidden_size = "unknown"
 
     dprint(f"\nNeuron Trace Configuration:")
-    dprint(f"- Inspecting {total_layers} layers with approximately {hidden_size} neurons each")
+    dprint(f"- Inspecting {total_layers} layers with approx. {hidden_size} neurons each")
     dprint(f"- Total neurons to analyze: ~{total_layers * hidden_size if isinstance(hidden_size, int) else 'unknown'}")
     dprint(f"- Will show top {neuron_trace_topk} most active neurons")
     dprint(f"- Tracing {'all token positions' if neuron_trace_all_positions else 'only the last token position'}\n")
 
     for layer_idx, layer in enumerate(layers):
         def hook_fn(module, inp, out, idx=layer_idx):
-            if neuron_trace_all_positions:
-                # Capture activations for all positions in the sequence
-                # Shape of out is [batch, sequence_length, hidden_size]
-                all_acts = out.detach().squeeze(0)  # Remove batch dimension
-
-                # Only look at newly generated tokens (skip prompt tokens)
-                # We can identify this by checking if the sequence length is greater than our prompt length
-                current_seq_len = all_acts.shape[0]
-                prompt_len = len(start_ids) if 'start_ids' in globals() else 0
-
-                if current_seq_len > prompt_len:
-                    # Process activations for all newly generated tokens
-                    new_tokens_acts = all_acts[prompt_len:]
-
-                    # For each neuron, add its activations for all new tokens
-                    for neuron_idx in range(all_acts.shape[1]):  # Loop over hidden dimension
-                        neuron_acts = new_tokens_acts[:, neuron_idx].tolist()
-                        for val in neuron_acts:
-                            activations.setdefault((idx, neuron_idx), []).append(val)
+            all_acts = out.detach().squeeze(0)
+            prompt_len = len(start_ids) if 'start_ids' in globals() else 0
+            if neuron_trace_all_positions and all_acts.shape[0] > prompt_len:
+                new_acts = all_acts[prompt_len:]
             else:
-                # Original behavior: capture only last-token activations
-                last_act = out[:, -1, :].detach().squeeze(0)
-                for neuron_idx, val in enumerate(last_act.tolist()):
+                new_acts = all_acts[-1:, :]
+            for t in range(new_acts.shape[0]):
+                for neuron_idx, val in enumerate(new_acts[t].tolist()):
                     activations.setdefault((idx, neuron_idx), []).append(val)
-
         hooks.append(layer.register_forward_hook(hook_fn))
     return hooks
 
 # -----------------------------------------------------------------------------
-# GENERATION logic
+# Baseline‐Normalization Helpers
+# -----------------------------------------------------------------------------
+baseline_prompts_file = "baseline.json"
+
+def compute_average_activations(prompts):
+    agg = {}
+    counts = {}
+    for prompt in tqdm(prompts, desc="Baseline/Concept activations"):
+        start_ids_loc = encode(prompt)
+        x_loc = torch.tensor(start_ids_loc, dtype=torch.long, device=device)[None, ...]
+        acts = {}
+        hooks = make_hooks(acts)
+        with torch.no_grad():
+            _ = gen_model.generate(x_loc,
+                                   max_new_tokens=max_new_tokens,
+                                   temperature=temperature,
+                                   top_k=top_k)
+        for h in hooks: h.remove()
+        # average per neuron for this prompt
+        for neuron, vals in acts.items():
+            avg_val = float(np.mean(vals))
+            agg[neuron] = agg.get(neuron, 0.0) + avg_val
+            counts[neuron] = counts.get(neuron, 0) + 1
+    # finalize average
+    return {n: agg[n] / counts[n] for n in agg}
+
+# -----------------------------------------------------------------------------
+# GENERATION logic (with baseline subtraction)
 # -----------------------------------------------------------------------------
 if master:
-    # Read prompts from JSON file
+    # load concept prompts
     if os.path.exists(prompts_file):
-        try:
-            with open(prompts_file, 'r', encoding='utf-8') as f:
-                data = json.load(f)
-                prompts = data.get("prompts", [])
-                # If concept is in the file, use it; otherwise use filename
-                concept = data.get("concept", concept_name)
-        except json.JSONDecodeError:
-            dprint(f"Error: {prompts_file} is not a valid JSON file")
-            sys.exit(1)
+        with open(prompts_file, 'r', encoding='utf-8') as f:
+            data = json.load(f)
+            prompts = data.get("prompts", [])
+            concept = data.get("concept", concept_name)
     else:
-        dprint(f"Error: {prompts_file} not found. Please create this file with prompts for the concept.")
+        dprint(f"Error: {prompts_file} not found.")
         sys.exit(1)
 
-    dprint(f"Loaded {len(prompts)} prompts for concept '{concept}'")
+    # load baseline prompts
+    if os.path.exists(baseline_prompts_file):
+        with open(baseline_prompts_file, 'r', encoding='utf-8') as f:
+            bdata = json.load(f)
+            baseline_prompts = bdata.get("prompts", [])
+    else:
+        dprint(f"Error: {baseline_prompts_file} not found.")
+        sys.exit(1)
 
-    # Initialize counter for neuron occurrences
+    dprint(f"Loaded {len(prompts)} concept prompts and {len(baseline_prompts)} baseline prompts")
+
+    # compute baseline activations once
+    dprint("Computing baseline activations...")
+    baseline_acts = compute_average_activations(baseline_prompts)
+    dprint("Baseline activations computed.")
+
+    # initialize occurrence counter
     neuron_occurrences = Counter()
 
-    # Process each prompt
+    # process each concept prompt as before, but rank by (avg - baseline)
     for prompt_idx, prompt in enumerate(prompts):
-        dprint(f"\n{'=' * 80}\nProcessing prompt {prompt_idx + 1}/{len(prompts)}:\n{prompt}\n{'=' * 80}")
-
+        dprint(f"\n{'='*40}\nPrompt {prompt_idx+1}/{len(prompts)}: {prompt}\n{'='*40}")
         start_ids = encode(prompt)
         x = torch.tensor(start_ids, dtype=torch.long, device=device)[None, ...]
 
-        # Generate multiple samples per prompt
         for k in range(num_samples):
-            dprint(f"\nGenerating sample {k + 1}/{num_samples} for prompt {prompt_idx + 1}")
-
             activations = {}
             hooks = make_hooks(activations)
-
             with torch.no_grad():
-                y = gen_model.generate(
-                    x,
-                    max_new_tokens=max_new_tokens,
-                    temperature=temperature,
-                    top_k=top_k
-                )
+                y = gen_model.generate(x,
+                                       max_new_tokens=max_new_tokens,
+                                       temperature=temperature,
+                                       top_k=top_k)
+            for h in hooks: h.remove()
 
-            for h in hooks:
-                h.remove()
-
-            # Average activations per neuron
+            # compute per-neuron avg and diff
             records = []
-            for (layer_idx, neuron_idx), vals in activations.items():
-                avg_val = sum(vals) / len(vals)
-                records.append((layer_idx, neuron_idx, avg_val))
-
-            dprint(f"\nAnalyzed activations for {len(records)} neurons")
-            records.sort(key=lambda x: x[2], reverse=True)
+            for (layer, neuron), vals in activations.items():
+                avg_val = float(np.mean(vals))
+                base = baseline_acts.get((layer, neuron), 0.0)
+                diff = avg_val - base
+                records.append((layer, neuron, avg_val, diff))
+            # sort by diff
+            records.sort(key=lambda x: x[3], reverse=True)
             top_records = records[:neuron_trace_topk]
 
-            # Count occurrences of each neuron in top-k
-            for layer, neuron, _ in top_records:
+            # count occurrences
+            for layer, neuron, _, _ in top_records:
                 neuron_occurrences[(layer, neuron)] += 1
 
-            # Save individual trace data
+            # save individual trace
             concept_dir = os.path.join(out_dir, concept)
             os.makedirs(concept_dir, exist_ok=True)
-            trace_path = os.path.join(concept_dir, f'neuron_trace_prompt_{prompt_idx + 1}_sample_{k + 1}.pkl')
+            trace_path = os.path.join(concept_dir,
+                                      f'neuron_trace_prompt_{prompt_idx+1}_sample_{k+1}.pkl')
             with open(trace_path, 'wb') as f:
-                pickle.dump({'prompt': prompt, 'prompt_idx': prompt_idx + 1, 'sample': k + 1, 'trace': top_records}, f)
+                pickle.dump({
+                    'prompt': prompt,
+                    'prompt_idx': prompt_idx+1,
+                    'sample': k+1,
+                    'trace': top_records
+                }, f)
 
-            # Output sample generation text
-            dprint(f"\nGenerated text (sample {k + 1}):")
+            # show generated text
+            dprint(f"\nGenerated text sample {k+1}:")
             dprint(decode(y[0].tolist()))
 
-    # Identify the most consistent "concept neurons"
-    max_possible_occurrences = len(prompts) * num_samples
-    dprint(f"\n{'=' * 80}\nMost consistent {concept} neurons\n{'=' * 80}")
-    dprint(f"Total prompts: {len(prompts)}, samples per prompt: {num_samples}")
-    dprint(f"Maximum possible occurrences: {max_possible_occurrences}")
-
+    # final ranking by occurrence (still concept-specific)
+    max_occ = len(prompts) * num_samples
+    dprint(f"\n{'='*20}\nMost consistent {concept} neurons\n{'='*20}")
+    dprint(f"Max possible occurrences: {max_occ}")
     top_neurons = neuron_occurrences.most_common(neuron_trace_topk)
-    dprint(f"\nTop {neuron_trace_topk} neurons most consistently activated by {concept} content:")
-    dprint("Rank  Layer  Neuron  Occurrences  % of Samples")
+    dprint("Rank  Layer  Neuron  Occurrences  %")
+    for rank, ((layer, neuron), cnt) in enumerate(top_neurons, 1):
+        pct = cnt/max_occ*100
+        dprint(f"{rank:4d}  {layer:5d}  {neuron:6d}  {cnt:11d}  {pct:6.2f}%")
 
-    for rank, ((layer, neuron), count) in enumerate(top_neurons, 1):
-        percentage = (count / max_possible_occurrences) * 100
-        dprint(f"{rank:4d}  {layer:5d}  {neuron:6d}  {count:11d}  {percentage:11.2f}%")
-
-    # Save the overall results
+    # save overall results
     concept_neurons_path = os.path.join(concept_dir, f'{concept}_neurons.pkl')
     with open(concept_neurons_path, 'wb') as f:
         pickle.dump({
             'concept': concept,
+            'baseline_acts': baseline_acts,
             'neuron_occurrences': dict(neuron_occurrences),
             'top_neurons': top_neurons,
             'prompts': prompts,
-            'num_samples': num_samples,
-            'max_occurrences': max_possible_occurrences
+            'baseline_prompts': baseline_prompts
         }, f)
-
-    dprint(f"\n{concept.capitalize()} neuron analysis complete! Results saved to {concept_neurons_path}")
+    dprint(f"\nAnalysis complete! Results at {concept_neurons_path}")
 
 # CLEANUP
 if ddp:

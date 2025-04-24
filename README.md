@@ -320,36 +320,3 @@ Falling back to stored training store
 > However, as the LLMs are not trained for any retrieval tasks, the embedding here is not meaningful for similarity retrieval (or at least not working well with cosine function).
 > Indeed, if using BLMs, and a sense vector having the concept of "toxic". We can leverage the sense vector to retrieve the training data NNs and remove them.
 > In this case, the sense vectors may have "cleaner" representations of "toxic" than the token embeddings.
-
-
-### neuron tracing
-
-
-- Insight 10: Can we trace neurons that highly activate during the generation process? During multiple forward pass, we may be able to identify the role of specific neurons.
-
-> The neuron tracing is focused on the hidden states of each transformer 
-> block because these are most commonly understood as the "neurons" in transformer 
-> models and tend to be where interpretable features are encoded.
-
->  The neuron trace procedure efficiently identifies the most influential neurons during model generation by attaching forward hooks
-to each transformer layer that capture per-neuron activations for each new token.
-As the model generates text autoregressively, these hooks record activations
-at each timestep. After generation completes, the algorithm computes each
-neuron's average activation across all tokens, then ranks and selects the
-top K most active neurons as the "trace." 
-
-> Lesson: Based on the observation that the neuron trace algorithm yields nearly 
-> identical "highly activating neurons" across different concepts (e.g., Vietnam and tulips), 
-> we learn an important lesson about transformer-based language models. While we 
-> might expect concept-specific neurons for distinct topics, these results suggest 
-> that modern language models likely organize information in more distributed and 
-> entangled ways than the theory we would predict. 
-> Rather than dedicated neurons for specific concepts, these models appear to rely 
-> on patterns of activation across shared neural pathways. This explains why the 
-> same neurons in layers 9-11 activate strongly regardless of topic - they may 
-> represent higher-level linguistic functions essential to coherent text generation, 
-> such as maintaining grammatical consistency, tracking context, or managing output 
-> formatting, rather than encoding specific semantic content. This insight challenges 
-> our intuition about how neural networks represent knowledge and suggests we need 
-> more sophisticated techniques to truly untangle concept-specific representations 
-> within these models.
