@@ -320,3 +320,8 @@ Falling back to stored training store
 > However, as the LLMs are not trained for any retrieval tasks, the embedding here is not meaningful for similarity retrieval (or at least not working well with cosine function).
 > Indeed, if using BLMs, and a sense vector having the concept of "toxic". We can leverage the sense vector to retrieve the training data NNs and remove them.
 > In this case, the sense vectors may have "cleaner" representations of "toxic" than the token embeddings.
+
+
+## inference insights
+
+I have done neuron tracing algorithms and steering experiments. Visit [NEURON TRACING](https://github.com/giangnguyen2412/training-interpretable-llms/blob/main/R_NEURON_TRACE.MD) to see my insights when playing with neurons.
