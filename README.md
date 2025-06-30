@@ -284,6 +284,8 @@ Falling back to stored training store
 > Then, the model generates one character at a time, and the training data is also tokenized into characters. 
 > This means that the model is learning to predict the next character in a sequence, rather than the next word.
 
+> Well! one-word-at-a-time generation could be slow.
+
 - Insight 6 - Training data attribution vs. influence.
 > Training Data Attribution: Pinpointing the specific training examples that directly cause or contain a fact in a model’s output, focusing on factual entailment. For example, if an LLM correctly states, "The capital of France is Paris," attribution would point to the training data that explicitly contains this fact (e.g., a sentence like "The capital of France is Paris").
 > For instance, an influential example might teach the model a pattern or association that indirectly affects its output, like learning that certain names are commonly associated with specific roles or entities. --> kNN may be a post-hoc instantiation of this.
@@ -322,8 +324,8 @@ Falling back to stored training store
 > The embedding is extracted at the last layer of the transformer. For example, with the context length of 1024, the embedding for the whole context is torch.Size([1, 1024, 768]).
 > So what I am doing is that I pool over 1024 tokens to get just one vector of torch.Size([1, 768]) that represents both (input prompt + output) and retrieve NNs based on this vector.
 > However, as the LLMs are not trained for any retrieval tasks, the embedding here is not meaningful for similarity retrieval (or at least not working well with cosine function).
-> Indeed, if using BLMs, and a sense vector having the concept of "toxic". We can leverage the sense vector to retrieve the training data NNs and remove them.
-> In this case, the sense vectors may have "cleaner" representations of "toxic" than the token embeddings.
+> Indeed, if using [Backpack Language Models (BLMs)](https://arxiv.org/abs/2305.16765), and a sense vector having the concept of "toxic". We can leverage the sense vector to retrieve the training data NNs and remove them.
+> In this case, the sense vectors may have better representations of "toxic" than the token embeddings.
 
 
 ## inference insights
