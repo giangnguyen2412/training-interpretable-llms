@@ -250,17 +250,21 @@ Falling back to stored training store
 
 > Observation: I think this question boils down to: "Is training nearest neighbor meaningful for generative tasks?"
 > For example, in classification tasks, using NNs may help users compare and contrast the input vs. the NNs so see if the model is correct or not (sorry but I am so overfit into model [verification task](https://proceedings.neurips.cc/paper_files/paper/2021/file/de043a5e421240eb846da8effe472ff1-Paper.pdf))
-> By contrast, in generative tasks, there is no clear boundary between input and output in the training as the training manner is 
-> text continuation/completion. Hence, the explanation "the model is generating this Y from X because in the training set there is a pair of (X_train, Y_train) that is similar to (X, Y)" does not trivial translate.
 
-> Proposed solution: Concatenate the input and output text together (during test time) and use this chunk of text to generate the embeddings for kNN retrieval.
+> Normally, we come to the training set of the predicted label and retrieve the NNs to the input to explain the prediction.
+
+> However, in generative tasks, there is no clear boundary between input and output. For example, we have a query X, and the model responses with the answer Y (a sequence of text). We cannot easily limit the search space using Y.
+> Of course, we can still try to find Y first in the training set and find the relevant training examplars w.r.t Y to explain it.
+
+> However, a straight-forward solution is: Concatenate the input and output text together (during test time) and treat this combined chunk of text as the query for kNN retrieval.
 > The explanation now is: "The model is generating this Y from X because in the training set there is a text chunk that is similar to (X + Y)".
 
 - Insight 4.1 - The concatenated text is exceeding the context length
-> In the beginning, we only use X to generate the embeddings for kNN retrieval.
-> Now, we have X+Y, which can often exceed the context length of the model.
-> For example, original X has 21 tokens and Y has 521 tokens, so the concatenated text has 542 tokens > 256 (context length).
-> I solved this by using sliding windows of 256 tokens and then perform the average pooling on the embeddings to get the representative embedding for the whole text chunk.
+> In the beginning, we only use X to generate the answer Y.
+> Now, we have X+Y for kNN retrieval, which can often exceed the context length of the model.
+> For example, original X has 21 tokens and Y has 521 tokens, so the concatenated text has 542 tokens > 256 (original context length).
+> We can solve this by using sliding windows of 256 tokens and then perform the average pooling on the embeddings to get the representative embedding for the whole text chunk.
+> Sliding windows (with step = 1) seem very slow because it makes the complexity almost o(N). We can do it with the step of len(window) which will reduce the runtime significantly to o(N/len(window))
 
 - Insight 4.2 - Can we go back to training and simply increase the context length?
 > When increasing the context length, only the position embeddings are changed to keep track of where tokens are in the text.
